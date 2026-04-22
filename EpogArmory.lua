@@ -1,13 +1,20 @@
 -- EpogArmory.lua
 -- single-addon mesh gear inspector. Every client runs the same code:
 -- scans self + groupmates in dungeons/raids, broadcasts chunked gear on the
--- "EpArmr" addon-message prefix (internal identifier, fits the 16-char cap),
--- receives other clients' broadcasts, and stores latest gear per GUID in
--- EpogArmoryDB for manual upload to epoglogs.com.
+-- "EpogArmory" addon-message prefix, receives other clients' broadcasts,
+-- and stores latest gear per GUID in EpogArmoryDB for manual upload to
+-- epoglogs.com.
 
 local ADDON = "EpogArmory"
-local PREFIX = "EpArmr"
+local PREFIX = "EpogArmory"
+-- Wire protocol family. Bump only for breaking schema changes (field reorder /
+-- semantic shift). Receivers accept any payload beginning with "v" .. PROTO and
+-- ignore trailing tokens they don't understand, so additive changes (new fields
+-- after gear slot 19, i.e. positions 31+) ride the same PROTO without breaking
+-- older clients.
 local PROTO = "1"
+local ADDON_VERSION = GetAddOnMetadata(ADDON, "Version") or "0"
+local RELEASES_URL = "https://github.com/Defcons/epogarmory-addon/releases/"
 
 -- Tuning
 local INSPECT_COOLDOWN      = 900
@@ -20,7 +27,7 @@ local ROSTER_TICK           = 10
 local MIN_INSPECT_LEVEL     = 60
 local MIN_STORE_LEVEL       = 60
 local MIN_STORE_EQUIPPED    = 10
--- (v1.1): dominant-tree rule mirroring the server-side validator in
+-- (v0.7): dominant-tree rule mirroring the server-side validator in
 -- warcraftlogs-epog routes/admin.js computePrimaryTree(). A scan is only accepted
 -- when the player has meaningfully committed to a spec — either the max tree has
 -- the 31-point capstone unlocked OR they have ≥61 total points (Ascension gives
@@ -65,6 +72,15 @@ local outQueue = {}
 local nextInspectAt, nextSendAt, lastRoster = 0, 0, 0
 local msgCounter = 0
 local assembly = {}
+
+-- Version ping: broadcast our ADDON_VERSION once at T+120s after login so
+-- groupmates/guildmates running the addon learn when a newer release is out.
+-- Listening is always-on via OnAddonMessage; the outbound ping is one-shot.
+local VERSION_PING_DELAY = 120
+local VERSION_PING_RETRY = 60 -- if no broadcast channel available (solo + no guild), defer
+local versionPingAt      = 0
+local versionPingSent    = false
+local versionNotified    = false
 
 -- item-info cache. EpogItemCacheDB is the persistent half; pendingCache
 -- is the in-memory retry queue for items the client hasn't fetched yet.
@@ -299,7 +315,7 @@ local function ShouldStore(entry)
     if requireInstance and entry.zone ~= "party" and entry.zone ~= "raid" then
         return false, string.format("zone=%s (requireInstance on)", tostring(entry.zone))
     end
-    -- (v1.1): reject scans without a committed spec. Matches the server-side
+    -- (v0.7): reject scans without a committed spec. Matches the server-side
     -- validator in warcraftlogs-epog routes/admin.js — 31+ in max tree OR 61+ total.
     local s1 = (entry.spec and entry.spec[1]) or 0
     local s2 = (entry.spec and entry.spec[2]) or 0
@@ -335,7 +351,14 @@ end
 
 local function ParsePayload(payload)
     local t = { strsplit("^", payload) }
-    if t[1] ~= ("v" .. PROTO) then return nil end
+    -- Accept any payload in the same PROTO family: exact "v<PROTO>" or
+    -- "v<PROTO>.<minor>" (future soft-bump). Reject a different major (e.g. "v2").
+    -- Unknown trailing tokens past slot 19 (position 31+) are ignored — that's
+    -- our forward-compat channel for additive changes.
+    local tag = t[1]
+    if not tag or (tag ~= ("v" .. PROTO) and not tag:match("^v" .. PROTO .. "%.")) then
+        return nil
+    end
     local entry = {
         name      = t[2] or "",
         realm     = t[3] or "",
@@ -393,6 +416,57 @@ local function Ingest(payload, sender)
         date("%H:%M:%S", entry.scanTime)))
 end
 
+-- Numeric-tuple semver compare. Returns 1 if a > b, -1 if a < b, 0 equal.
+-- Non-numeric suffixes (e.g. "-beta") are ignored — only digit runs count.
+local function CompareVersions(a, b)
+    if a == b then return 0 end
+    local function parts(v)
+        local out = {}
+        for n in tostring(v or ""):gmatch("(%d+)") do out[#out+1] = tonumber(n) end
+        return out
+    end
+    local pa, pb = parts(a), parts(b)
+    local len = math.max(#pa, #pb)
+    for i = 1, len do
+        local na, nb = pa[i] or 0, pb[i] or 0
+        if na ~= nb then return na > nb and 1 or -1 end
+    end
+    return 0
+end
+
+local function HandleVersionPing(payload, sender)
+    -- payload shape: "VER^<version>"
+    local tag, senderVersion = strsplit("^", payload)
+    if tag ~= "VER" or not senderVersion or senderVersion == "" then return end
+    dprint(string.format("[version] %s is on v%s (we're v%s)",
+        sender or "?", senderVersion, ADDON_VERSION))
+    if versionNotified then return end
+    if CompareVersions(senderVersion, ADDON_VERSION) <= 0 then return end
+    versionNotified = true
+    print(string.format("|cffffaa44EpogArmory|r: newer version |cff00ff00v%s|r available (you're on v%s). Download: %s",
+        senderVersion, ADDON_VERSION, RELEASES_URL))
+end
+
+local function TrySendVersionPing()
+    if versionPingSent then return end
+    if now() < versionPingAt then return end
+    local channels = PickChannels()
+    if #channels == 0 then
+        -- Solo + no guild: no one to ping yet. Defer and try again.
+        versionPingAt = now() + VERSION_PING_RETRY
+        return
+    end
+    versionPingSent = true
+    msgCounter = msgCounter + 1
+    local msgID = string.format("V%x", msgCounter % 0xffff)
+    local body = string.format("%s^1^1^VER^%s", msgID, ADDON_VERSION)
+    for _, ch in ipairs(channels) do
+        outQueue[#outQueue + 1] = { ch = ch, body = body }
+    end
+    dprint(string.format("[version] pinging v%s on [%s]",
+        ADDON_VERSION, table.concat(channels, "+")))
+end
+
 local function OnAddonMessage(prefix, body, channel, sender)
     if prefix ~= PREFIX then return end
     if not body or body == "" then return end
@@ -423,7 +497,13 @@ local function OnAddonMessage(prefix, body, channel, sender)
         assembly[key] = nil
         dprint(string.format("[recv] complete from %s — %d chunks assembled (%d bytes)",
             sender or "?", total, #full))
-        Ingest(full, sender)
+        -- Route VER pings separately from gear payloads; they share the reassembly
+        -- framing but decode to a different shape.
+        if full:sub(1, 4) == "VER^" then
+            HandleVersionPing(full, sender)
+        else
+            Ingest(full, sender)
+        end
     end
 end
 
@@ -613,6 +693,7 @@ f:SetScript("OnUpdate", function(self, elapsed)
     TryInspect()
     TryScanSelf()
     TryCachePending()
+    TrySendVersionPing()
 
     gcAcc = gcAcc + 0.25
     if gcAcc >= 10 then gcAcc = 0; GCAssembly() end
@@ -638,6 +719,7 @@ f:SetScript("OnEvent", function(self, event, ...)
         requireInstance = EpogArmoryDB.config.requireInstance
         EpogItemCacheDB = EpogItemCacheDB or {}
         RequestSelfScan(SELF_SCAN_LOGIN_DELAY) -- initial self-scan after talent data warms up
+        versionPingAt = now() + VERSION_PING_DELAY -- one-shot version broadcast, 2min after login
         return
     end
     if event == "CHAT_MSG_ADDON" then
