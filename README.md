@@ -83,6 +83,10 @@ Two `SavedVariables` tables:
 
 Nothing leaves your computer except via the addon-message channel (same class of traffic as DBM, Recount, Details, etc.). No web requests.
 
+## Credits
+
+Built by **Defcon**.
+
 ## License
 
 MIT.
