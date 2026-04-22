@@ -1,5 +1,5 @@
 -- EpogArmory.lua
--- Claude: single-addon mesh gear inspector. Every client runs the same code:
+-- single-addon mesh gear inspector. Every client runs the same code:
 -- scans self + groupmates in dungeons/raids, broadcasts chunked gear on the
 -- "EpArmr" addon-message prefix (internal identifier, fits the 16-char cap),
 -- receives other clients' broadcasts, and stores latest gear per GUID in
@@ -11,7 +11,7 @@ local PROTO = "1"
 
 -- Tuning
 local INSPECT_COOLDOWN      = 900
-local OUT_OF_RANGE_COOLDOWN = 30     -- Claude: retry fast when CanInspect fails
+local OUT_OF_RANGE_COOLDOWN = 30     -- retry fast when CanInspect fails
 local INSPECT_TIMEOUT       = 4
 local INSPECT_INTERVAL      = 2.5
 local BROADCAST_STAGGER     = 0.3
@@ -20,7 +20,7 @@ local ROSTER_TICK           = 10
 local MIN_INSPECT_LEVEL     = 60
 local MIN_STORE_LEVEL       = 60
 local MIN_STORE_EQUIPPED    = 10
--- Claude (v1.1): dominant-tree rule mirroring the server-side validator in
+-- (v1.1): dominant-tree rule mirroring the server-side validator in
 -- warcraftlogs-epog routes/admin.js computePrimaryTree(). A scan is only accepted
 -- when the player has meaningfully committed to a spec — either the max tree has
 -- the 31-point capstone unlocked OR they have ≥61 total points (Ascension gives
@@ -29,7 +29,7 @@ local MIN_STORE_EQUIPPED    = 10
 local MIN_STORE_DOMINANT    = 31
 local MIN_STORE_TOTAL       = 61
 local ASSEMBLY_TIMEOUT      = 60
-local SCAN_FRESH_WINDOW     = 86400  -- Claude: 24h — skip re-inspecting a player anyone in the mesh scanned recently
+local SCAN_FRESH_WINDOW     = 86400  -- 24h — skip re-inspecting a player anyone in the mesh scanned recently
 
 -- Runtime config, persisted in EpogArmoryDB.config on logout.
 local requireInstance = true
@@ -66,7 +66,7 @@ local nextInspectAt, nextSendAt, lastRoster = 0, 0, 0
 local msgCounter = 0
 local assembly = {}
 
--- Claude: item-info cache. EpogItemCacheDB is the persistent half; pendingCache
+-- item-info cache. EpogItemCacheDB is the persistent half; pendingCache
 -- is the in-memory retry queue for items the client hasn't fetched yet.
 local pendingCache = {} -- itemID -> firstSeenTime
 local CACHE_RETRY_INTERVAL = 0.5
@@ -105,7 +105,7 @@ local function ItemStringFromLink(link)
     return s or ""
 end
 
--- Claude: mark a GUID as inspected at unix timestamp `scanTime`. Called from
+-- mark a GUID as inspected at unix timestamp `scanTime`. Called from
 -- both local successful inspects and gossip-reassembled broadcasts. Keeps the
 -- max of current vs new so older arrivals don't overwrite fresh data.
 local function MarkInspected(guid, scanTime)
@@ -125,7 +125,7 @@ local function HasFreshScan(guid)
 end
 
 -- ---------------- Item-info cache ----------------
--- Claude: for every itemID we see on a scanned player, query GetItemInfo()
+-- for every itemID we see on a scanned player, query GetItemInfo()
 -- locally. If the client already has the item cached, we get
 -- name/quality/itemLevel/texture and persist to EpogItemCacheDB so the web
 -- site can render without needing external data sources. If the client hasn't
@@ -145,7 +145,7 @@ local function TriggerItemFetch(itemID)
     cacheTip:Hide()
 end
 
--- Claude: returns true if GetItemInfo succeeded and we wrote to the cache,
+-- returns true if GetItemInfo succeeded and we wrote to the cache,
 -- false if still pending (client hasn't resolved the item yet).
 local function CacheItemInfo(itemID)
     if not itemID or itemID <= 0 then return false end
@@ -194,7 +194,7 @@ local function TryCachePending()
     end
 end
 
--- Claude: iterate gear slots, ensure every itemID is either cached or queued.
+-- iterate gear slots, ensure every itemID is either cached or queued.
 local function CachePayloadItems(entry)
     if not entry or not entry.gear then return end
     for slot = 1, 19 do
@@ -218,7 +218,7 @@ local function BuildPayload(unit, guid)
     classFile = classFile or ""
     local level = UnitLevel(unit) or 0
 
-    -- Claude: GetTalentTabInfo's second arg is the inspect flag — pass 1 when
+    -- GetTalentTabInfo's second arg is the inspect flag — pass 1 when
     -- reading another unit's talents (after NotifyInspect), nil when reading
     -- our own talents from a direct "player" scan.
     local inspectFlag = UnitIsUnit(unit, "player") and nil or 1
@@ -299,7 +299,7 @@ local function ShouldStore(entry)
     if requireInstance and entry.zone ~= "party" and entry.zone ~= "raid" then
         return false, string.format("zone=%s (requireInstance on)", tostring(entry.zone))
     end
-    -- Claude (v1.1): reject scans without a committed spec. Matches the server-side
+    -- (v1.1): reject scans without a committed spec. Matches the server-side
     -- validator in warcraftlogs-epog routes/admin.js — 31+ in max tree OR 61+ total.
     local s1 = (entry.spec and entry.spec[1]) or 0
     local s2 = (entry.spec and entry.spec[2]) or 0
@@ -452,7 +452,7 @@ local function AddUnit(unit)
     if inQueue[guid] then return end
     local last = seen[guid]
     if last and (now() - last) < INSPECT_COOLDOWN then return end
-    if HasFreshScan(guid) then return end -- Claude: someone in the mesh scanned this player <24h ago
+    if HasFreshScan(guid) then return end -- someone in the mesh scanned this player <24h ago
     if (UnitLevel(unit) or 0) < MIN_INSPECT_LEVEL then return end
     queue[#queue + 1] = { guid = guid, unit = unit }
     inQueue[guid] = true
@@ -508,7 +508,7 @@ local function CheckTimeout()
     if current and (now() - current.startedAt) > INSPECT_TIMEOUT then
         dprint(string.format("[inspect] TIMEOUT: %s — no INSPECT_TALENT_READY after %ds, retry in %ds",
             UnitName(current.unit) or "?", INSPECT_TIMEOUT, OUT_OF_RANGE_COOLDOWN))
-        markRetryIn(current.guid, OUT_OF_RANGE_COOLDOWN) -- Claude: transient fail, short retry (not 15 min)
+        markRetryIn(current.guid, OUT_OF_RANGE_COOLDOWN) -- transient fail, short retry (not 15 min)
         ClearCurrent()
     end
 end
@@ -530,11 +530,11 @@ local function OnInspectReady()
         dprint(string.format("[inspect] OK: %s L%d — %d slots equipped, payload %d bytes",
             tname, tlvl, info, #payload))
         EnqueueBroadcast(payload, tname)
-        -- Claude: direct-ingest our own scan so we save data even when no one
+        -- direct-ingest our own scan so we save data even when no one
         -- else is in our broadcast channels.
         Ingest(payload, UnitName("player"))
     else
-        -- Claude: incomplete inspect data (0-9 slots) is usually transient —
+        -- incomplete inspect data (0-9 slots) is usually transient —
         -- target moved out mid-response or server was slow. Short retry, not
         -- the 15-min full cooldown which is reserved for successful scans.
         markRetryIn(c.guid, OUT_OF_RANGE_COOLDOWN)
@@ -546,7 +546,7 @@ local function OnInspectReady()
 end
 
 -- ---------------- Self-scan ----------------
--- Claude: scanning yourself is a free fast path — no NotifyInspect required,
+-- scanning yourself is a free fast path — no NotifyInspect required,
 -- GetInventoryItemLink("player", slot) works immediately. Triggered by
 -- UNIT_INVENTORY_CHANGED (debounced 2s so equipping a set doesn't fire 19
 -- times) and once on PLAYER_LOGIN after a 3s warmup for talent data.
@@ -624,7 +624,7 @@ f:RegisterEvent("PARTY_MEMBERS_CHANGED")
 f:RegisterEvent("RAID_ROSTER_UPDATE")
 f:RegisterEvent("INSPECT_TALENT_READY")
 f:RegisterEvent("CHAT_MSG_ADDON")
-f:RegisterEvent("UNIT_INVENTORY_CHANGED") -- Claude: self gear changes trigger a rescan of "player"
+f:RegisterEvent("UNIT_INVENTORY_CHANGED") -- self gear changes trigger a rescan of "player"
 
 f:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
@@ -637,7 +637,7 @@ f:SetScript("OnEvent", function(self, event, ...)
         end
         requireInstance = EpogArmoryDB.config.requireInstance
         EpogItemCacheDB = EpogItemCacheDB or {}
-        RequestSelfScan(SELF_SCAN_LOGIN_DELAY) -- Claude: initial self-scan after talent data warms up
+        RequestSelfScan(SELF_SCAN_LOGIN_DELAY) -- initial self-scan after talent data warms up
         return
     end
     if event == "CHAT_MSG_ADDON" then
@@ -687,7 +687,7 @@ local function CountPending()
     return n
 end
 
--- Claude: iterate all stored players and feed every itemID through the cache.
+-- iterate all stored players and feed every itemID through the cache.
 -- Anything not cached locally gets queued for a SetHyperlink-triggered server
 -- fetch; the OnUpdate poll picks them up over the next few seconds.
 local function CacheBuildAll()
