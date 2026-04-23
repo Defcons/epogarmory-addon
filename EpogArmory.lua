@@ -7,11 +7,50 @@
 
 local ADDON = "EpogArmory"
 local PREFIX = "EpogArmory"
--- Wire protocol family. Bump only for breaking schema changes (field reorder /
--- semantic shift). Receivers accept any payload beginning with "v" .. PROTO and
--- ignore trailing tokens they don't understand, so additive changes (new fields
--- after gear slot 19, i.e. positions 31+) ride the same PROTO without breaking
--- older clients.
+
+-- ============================================================================
+-- FORWARD COMPATIBILITY — READ BEFORE EDITING THE WIRE FORMAT OR DB SHAPES
+-- ============================================================================
+-- The mesh must accept any version of the addon talking to any other. The
+-- protections:
+--
+-- 1. APPEND-ONLY WIRE FORMAT. Positions 1..30 of the caret-delimited payload
+--    are frozen forever (proto tag, name, realm, class, level, guid, spec,
+--    scanTime, zone, gear slots 1..19). New fields land at position 31+.
+--    Receivers silently drop unknown trailing tokens, so old clients never
+--    reject new payloads — they just miss fields they don't know.
+--
+-- 2. PROTO LENIENCY. ParsePayload accepts "v<PROTO>" exactly AND
+--    "v<PROTO>.<minor>". Lets us nudge the protocol subtly without breaking
+--    old parsers (e.g. "v1.2" won't be rejected by a "v1"-only reader).
+--
+-- 3. ITEM DATA IS LOCAL, NOT TRANSMITTED. stats / tooltipStats / setBonuses /
+--    damage / speed / tooltipExtras are all computed locally from
+--    GetItemStats and tooltip scans — they never cross the mesh. Adding new
+--    captured fields does NOT require mesh coordination. Each client resolves
+--    items independently from its own live game data.
+--
+-- Rules (never break these):
+--   a. Never reorder existing wire positions. Only append at position 31+.
+--   b. Never change a field's semantics. If ITEM_MOD_STRENGTH_SHORT is
+--      strength today, it's strength forever. Add new fields instead.
+--   c. Never remove fields — old clients may read them. Set to nil, let
+--      absence signal unavailable.
+--
+-- ESCAPE HATCH: if a change is genuinely impossible additively, bump
+-- PROTO = "1" to "2". The new client emits BOTH v1 and v2 payloads during a
+-- transition window (months); v2 receivers prefer v2, fall back to v1. After
+-- widespread adoption, drop v1 emit. Much later, drop v1 receive. No public
+-- release has needed this yet.
+--
+-- ON-DISK MIGRATIONS:
+--   * EpogArmoryDB — MigratePlayers() runs every PLAYER_LOGIN and reshapes
+--     older per-player records idempotently. Add new migration branches
+--     there when changing the record shape.
+--   * EpogItemCacheDB — every entry carries `v = CACHE_SCHEMA`. Bump the
+--     constant when the entry shape changes; stale entries re-fetch on next
+--     touch. See CACHE_SCHEMA's own comment block for the schema version log.
+-- ============================================================================
 local PROTO = "1"
 local ADDON_VERSION = GetAddOnMetadata(ADDON, "Version") or "0"
 local RELEASES_URL = "https://github.com/Defcons/epogarmory-addon/releases/"
@@ -34,7 +73,15 @@ local MIN_INSPECT_LEVEL     = 60
 local MIN_STORE_LEVEL       = 60
 local MIN_STORE_EQUIPPED    = 10
 local ASSEMBLY_TIMEOUT      = 60
-local SCAN_FRESH_WINDOW     = 86400  -- 24h — skip re-inspecting a player anyone in the mesh scanned recently
+-- v0.34: reduced from 24h to 4h. AddUnit only ever fires for groupmates
+-- (called from ScanRoster's party/raid iteration), so this window controls
+-- how often we re-inspect teammates to catch spec / gear / PvP-trinket swaps
+-- that happen mid-session. Still shared mesh-wide via lastScanned, so when
+-- one client inspects and broadcasts, every peer's window restarts together
+-- and traffic converges to "one inspect per target per 4h across the mesh".
+-- Traffic impact: ~6x v0.33, which in a 40-player raid is roughly 6 × 12s
+-- of per-target broadcast drain ≈ 1 minute per target per day. Acceptable.
+local SCAN_FRESH_WINDOW     = 14400
 
 -- Runtime config, persisted in EpogArmoryDB.config on logout.
 local requireInstance = true
@@ -72,11 +119,51 @@ local UTILITY_ITEM_NAMES_ANY_SLOT = {
 }
 
 -- Slot-restricted name patterns. Applied only when the item is in the listed
--- equipment slots. Keyed by slot index (13, 14 = trinket slots).
+-- equipment slots. v0.33: Insignia patterns moved out — an Insignia trinket
+-- no longer rejects the scan; instead it marks the scan as a PvP loadout
+-- and routes gear into sets["pvp"] alongside the talent-tree sets.
 local UTILITY_ITEM_NAMES_BY_SLOT = {
-    [13] = { "Insignia" }, -- PvP trinkets: "Insignia of the Alliance/Horde" etc.
-    [14] = { "Insignia" },
+    -- (empty for now — future slot-specific utility patterns go here)
 }
+
+-- PvP loadout detection: an Insignia trinket in slot 13 or 14 flags the
+-- whole equipped set as a PvP loadout. Scanned as a distinct set keyed
+-- sets["pvp"] on the player record.
+local PVP_TRINKET_NAME_PATTERNS = { "Insignia" }
+local TRINKET_SLOTS = { 13, 14 }
+
+local function GearLooksPvP(gearLookup)
+    for _, slot in ipairs(TRINKET_SLOTS) do
+        local itemName = gearLookup(slot)
+        if itemName then
+            for _, pat in ipairs(PVP_TRINKET_NAME_PATTERNS) do
+                if itemName:find(pat, 1, true) then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- Live-unit variant: queries GetInventoryItemLink + GetItemInfo. Used in
+-- BuildPayload when we're the scanner.
+local function UnitLooksPvP(unit)
+    return GearLooksPvP(function(slot)
+        local link = GetInventoryItemLink(unit, slot)
+        return link and GetItemInfo(link) or nil
+    end)
+end
+
+-- Gear-table variant: reads itemstrings from a parsed payload. Used in
+-- Ingest when we're the receiver.
+local function EntryGearLooksPvP(gear)
+    if not gear then return false end
+    return GearLooksPvP(function(slot)
+        local str = gear[slot]
+        if not str or str == "" then return nil end
+        local iid = tonumber(str:match("^(%d+)"))
+        return iid and GetItemInfo(iid) or nil
+    end)
+end
 
 -- Enchant-name patterns matched by tooltip text on specific slots. Used when
 -- an enchant doesn't have a stable SpellItemEnchantment.dbc ID we can rely on
@@ -113,11 +200,246 @@ local CACHE_RETRY_INTERVAL = 0.5
 local CACHE_GIVE_UP        = 15
 -- Cache schema version. Bumped when the shape of EpogItemCacheDB[itemID]
 -- changes in a way that requires re-fetching. Entries with a lower (or
--- missing) .v are treated as stale on the next touch, so pre-v0.22 entries
--- (no stats field) get a fresh GetItemStats call.
+-- missing) .v are treated as stale on the next touch.
 -- v1: name/quality/itemLevel/icon/ts
 -- v2: + stats (v0.22)
-local CACHE_SCHEMA = 2
+-- v3: + tooltipStats for percent-based bonuses on old (pre-rating)
+--     items like Darkmantle. v0.26 release.
+-- v4: + Ascension PvP percent patterns (DAMAGE_VS_PLAYERS_PCT etc.) +
+--     hardened Set-bonus filter that catches "(N) Set:" piece-count lines
+--     in addition to plain "Set:" prefixes. v0.27 release.
+-- v5: + tooltipExtras array carrying raw "Chance on hit:" / "Use:" lines
+--     verbatim, so the site's armory tooltip can render item flavor text
+--     (procs, use-effects) that don't reduce to numeric stats. v0.28.
+-- v6: + setBonuses array carrying each "Set:" / "(N) Set:" line as a
+--     structured { pieces, text } entry so the armory tooltip can render
+--     the full set bonus block. Previously filtered out entirely. v0.29.
+-- v7: + damage range { min, max, school } + speed for weapons (GetItemStats
+--     only exposes DPS, not min/max or speed), and "Equip:" added to the
+--     tooltipExtras prefix whitelist so proc-style Equip lines (Hand of
+--     Justice etc.) get captured as flavor text. v0.30.
+-- v8: bug fix — the tooltipExtras prefix check used string.find with the
+--     plain=true flag combined with a `^` anchor, which doesn't anchor
+--     (plain=true disables pattern metacharacters). No extras were being
+--     captured since v0.28. Fixed with sub-and-equal compare. Schema bump
+--     forces re-fetch of v7 entries that silently captured nothing. v0.31.
+-- v9: + IsStatLikeEquipLine filter — Equip lines that describe pure stats
+--     already captured by GetItemStats ("Equip: +20 Attack Power." /
+--     "Equip: Increases critical strike rating by 20.") no longer land in
+--     tooltipExtras. Avoids rendering the same stat twice on the site.
+--     Proc lines with "chance" / "on hit" / "for N sec" / etc. are NOT
+--     stat-like and continue to be preserved. v0.32.
+local CACHE_SCHEMA = 9
+
+-- Tooltip-text patterns for percent-based stats that predate the rating
+-- system and aren't in GetItemStats' enum. Keys are plain uppercase tokens
+-- (deliberately NOT ITEM_MOD_* prefixed — the site's ingest maps these in
+-- a separate handler from the GetItemStats fields). Order matters: more
+-- specific patterns come first so they match before the generic fallbacks.
+-- Ordering matters here — more-specific patterns come first so they win the
+-- first-match break. Example: "damage and healing done by magical spells"
+-- must be tried before "healing done by magical spells" so a line with both
+-- concepts maps to SPELL_POWER_FLAT instead of HEALING_FLAT.
+local TOOLTIP_STAT_PATTERNS = {
+    -- ---------- Percent-based offensive (crit / hit) ----------
+    { "critical strike with melee and ranged attacks by (%-?%d+)%%", "CRIT_MELEE_RANGED_PCT" },
+    { "critical strike with spells by (%-?%d+)%%",                   "CRIT_SPELL_PCT" },
+    { "critical strike chance by (%-?%d+)%%",                        "CRIT_PCT" },
+    { "critical strike by (%-?%d+)%%",                               "CRIT_PCT" },
+    { "hit with melee and ranged attacks by (%-?%d+)%%",             "HIT_MELEE_RANGED_PCT" },
+    { "hit with spells by (%-?%d+)%%",                               "HIT_SPELL_PCT" },
+    { "Improves your chance to hit by (%-?%d+)%%",                   "HIT_PCT" },
+    { "be dodged or parried by (%-?%d+)%%",                          "EXPERTISE_PCT" },
+    -- ---------- Percent-based defensive (dodge / parry / block) ----------
+    { "chance to dodge an attack by (%-?%d+)%%",                     "DODGE_PCT" },
+    { "chance to parry an attack by (%-?%d+)%%",                     "PARRY_PCT" },
+    { "chance to block an attack by (%-?%d+)%%",                     "BLOCK_PCT" },
+    -- ---------- Flat regen (pre-rating) ----------
+    { "Restores (%d+) mana per 5 sec",                               "MP5" },
+    { "Restores (%d+) health per 5 sec",                             "HP5" },
+    -- ---------- Flat spell power / damage / healing (TBC-era items) ----------
+    -- "damage and healing" beats "healing" / "damage" alone.
+    { "damage and healing done by magical spells and effects by up to (%d+)", "SPELL_POWER_FLAT" },
+    { "damage and healing done by magical spells by up to (%d+)",    "SPELL_POWER_FLAT" },
+    { "healing done by magical spells and effects by up to (%d+)",   "HEALING_FLAT" },
+    { "healing done by magical spells by up to (%d+)",               "HEALING_FLAT" },
+    { "damage done by magical spells and effects by up to (%d+)",    "SPELL_DAMAGE_FLAT" },
+    { "damage done by magical spells by up to (%d+)",                "SPELL_DAMAGE_FLAT" },
+    -- Per-school (rare on WotLK gear but still present on some TBC drops)
+    { "damage done by Arcane spells and effects by up to (%d+)",     "SPELL_DAMAGE_ARCANE" },
+    { "damage done by Fire spells and effects by up to (%d+)",       "SPELL_DAMAGE_FIRE" },
+    { "damage done by Frost spells and effects by up to (%d+)",      "SPELL_DAMAGE_FROST" },
+    { "damage done by Nature spells and effects by up to (%d+)",     "SPELL_DAMAGE_NATURE" },
+    { "damage done by Shadow spells and effects by up to (%d+)",     "SPELL_DAMAGE_SHADOW" },
+    { "damage done by Holy spells and effects by up to (%d+)",       "SPELL_DAMAGE_HOLY" },
+    -- ---------- Other pre-rating flats ----------
+    { "Increased Defense %+(%d+)",                                   "DEFENSE_FLAT" },
+    { "Spell Penetration %+(%d+)",                                   "SPELL_PENETRATION_FLAT" },
+    { "Increases the block value of your shield by (%d+)",           "BLOCK_VALUE_FLAT" },
+    -- ---------- PvP-specific percent (Ascension "Rival's" gear etc.) ----------
+    -- Values stored as the positive raw number. Sign is implicit in the key
+    -- name: DAMAGE_VS_PLAYERS increases outgoing; DAMAGE_REDUCTION reduces
+    -- incoming (both are player buffs even though the tooltip verb differs).
+    { "damage dealt against other players by (%-?%d+)%%",            "DAMAGE_VS_PLAYERS_PCT" },
+    { "damage taken from other players by (%-?%d+)%%",               "DAMAGE_REDUCTION_VS_PLAYERS_PCT" },
+}
+
+-- Prefixes that mark "special" tooltip lines worth preserving verbatim into
+-- entry.tooltipExtras — procs, activated trinket effects, and other flavor
+-- text the site's armory tooltip renders as-is.
+local TOOLTIP_EXTRA_PREFIXES = {
+    "Chance on hit:",
+    "Use:",
+    "Equip:", -- v0.30: catch proc-style Equip lines (Hand of Justice etc.)
+}
+
+-- v0.32: stat-like Equip lines (e.g. "Equip: +20 Attack Power." or
+-- "Equip: Increases attack power by 20.") describe numeric stats that
+-- GetItemStats already captured into entry.stats. Including them in
+-- tooltipExtras would render the stat twice on the site's armory tooltip.
+-- This filter skips them; actual procs (containing "chance" / "on hit" /
+-- "for N sec" / etc.) do NOT match these patterns and still land in extras.
+local EQUIP_STAT_LINE_PATTERNS = {
+    "^Equip: %+%-?%d+ ",                        -- "Equip: +20 Attack Power."
+    "^Equip: Increases [%w ]+by %-?%d+%.?$",    -- "Equip: Increases attack power by 20."
+    "^Equip: Increases your [%w ]+by %-?%d+%.?$", -- "Equip: Increases your crit rating by 20."
+    "^Equip: Decreases your [%w ]+by %-?%d+%.?$", -- rare but possible
+    "^Equip: Restores %d+ [%w ]+per 5 sec%.?$",   -- "Equip: Restores 10 mana per 5 sec."
+}
+local function IsStatLikeEquipLine(text)
+    if not text then return false end
+    for _, pat in ipairs(EQUIP_STAT_LINE_PATTERNS) do
+        if text:match(pat) then return true end
+    end
+    return false
+end
+
+-- Parse a possible set-bonus line. Returns (pieces, description) if the line
+-- is a set bonus, or nil if it's not. Handles three formats seen in the wild:
+--   "Set: <desc>"               — no piece count (Ascension's Darkmantle etc.)
+--   "(N) Set: <desc>"           — N pieces required (Eskhandar's)
+--   "(N/M) Set: <desc>"         — N of M pieces active (some servers)
+local function ParseSetBonusLine(text)
+    if not text then return nil end
+    -- Try "(N/M) Set: ..." and "(N) Set: ..." — leading digits captured, any
+    -- trailing "/M" consumed by [/%d]*
+    local pieces, desc = text:match("^%((%d+)[/%d]*%)%s*Set:%s*(.+)$")
+    if pieces then return tonumber(pieces) or 0, desc end
+    -- Plain "Set: ..." format, no piece count
+    desc = text:match("^Set:%s*(.+)$")
+    if desc then return 0, desc end
+    return nil
+end
+
+-- Parse a weapon damage line. Three shapes:
+--   "9 - 17 Damage"              — plain physical
+--   "12 - 19 Holy Damage"        — pure elemental weapon
+--   "9 - 17 Damage\n+5 Fire"     — physical with elemental bonus (two lines;
+--                                   we capture the main range only)
+-- Returns (min, max, school) or nil. school is nil for plain physical.
+local function ParseDamageLine(text)
+    if not text then return nil end
+    local dmin, dmax, school = text:match("^(%d+)%s*%-%s*(%d+)%s+(%a*)%s*Damage$")
+    if not dmin then return nil end
+    dmin, dmax = tonumber(dmin), tonumber(dmax)
+    if not (dmin and dmax) then return nil end
+    if school == "" then school = nil end
+    return dmin, dmax, school
+end
+
+-- Parse a weapon speed line. The tooltip puts speed on the equip-slot line
+-- (e.g. "Main Hand<tab>Speed 2.80") or on its own. Capture the decimal.
+local function ParseSpeedLine(text)
+    if not text then return nil end
+    local s = text:match("Speed%s+(%d+%.?%d*)")
+    return s and tonumber(s) or nil
+end
+
+local tooltipScanTip
+-- Scan an item's tooltip once and return (stats, extras, setBonuses, damage, speed):
+--   stats       — percent-based / pre-rating stat table keyed by TOOLTIP_STAT_PATTERNS
+--   extras      — array of raw tooltip lines matching TOOLTIP_EXTRA_PREFIXES
+--   setBonuses  — array of { pieces, text } set-bonus entries
+--   damage      — { min, max, school? } for weapons (nil for armor)
+--   speed       — attack speed in seconds, e.g. 2.8 (nil for non-weapons)
+-- Any may be nil if nothing matched in that category.
+local function ScanTooltip(link)
+    if not link then return nil, nil, nil, nil, nil end
+    if not tooltipScanTip then
+        tooltipScanTip = CreateFrame("GameTooltip", "EpogArmoryTooltipStatsTip", UIParent, "GameTooltipTemplate")
+    end
+    tooltipScanTip:SetOwner(UIParent, "ANCHOR_NONE")
+    tooltipScanTip:ClearLines()
+    tooltipScanTip:SetHyperlink(link)
+
+    local stats, extras, setBonuses, damage, speed = nil, nil, nil, nil, nil
+    for i = 2, tooltipScanTip:NumLines() do
+        local fs = _G["EpogArmoryTooltipStatsTipTextLeft" .. i]
+        local text = fs and fs:GetText()
+        -- Also scan the right-column text since weapons put Speed there,
+        -- aligned with the equip-slot label on the left.
+        local fsR = _G["EpogArmoryTooltipStatsTipTextRight" .. i]
+        local textR = fsR and fsR:GetText()
+        if text then
+            -- Weapon damage + speed: captured once per scan. Speed can
+            -- appear in either column depending on server/client layout.
+            if not damage then
+                local dmin, dmax, school = ParseDamageLine(text)
+                if dmin then damage = { min = dmin, max = dmax, school = school } end
+            end
+            if not speed then
+                speed = ParseSpeedLine(text) or ParseSpeedLine(textR)
+            end
+
+            -- Set-bonus lines: captured structurally, not filtered.
+            local pieces, desc = ParseSetBonusLine(text)
+            if desc then
+                setBonuses = setBonuses or {}
+                setBonuses[#setBonuses + 1] = { pieces = pieces, text = desc }
+            else
+                -- First try stat patterns. Matches accumulate into the stats
+                -- table; the line is then "consumed" and not considered for
+                -- extras.
+                local matched = false
+                for _, pat in ipairs(TOOLTIP_STAT_PATTERNS) do
+                    local n = text:match(pat[1])
+                    if n then
+                        n = tonumber(n)
+                        if n and n ~= 0 then
+                            stats = stats or {}
+                            stats[pat[2]] = (stats[pat[2]] or 0) + n
+                            matched = true
+                            break
+                        end
+                    end
+                end
+                -- If the line didn't resolve to a stat, check whether it's a
+                -- special-effect line worth preserving verbatim. We use a
+                -- direct prefix compare instead of string.find with a `^`
+                -- anchor — combining `^` with plain=true doesn't anchor
+                -- (plain=true disables pattern metacharacters) and combining
+                -- `^` without plain=true requires escaping `-` / `(` / `)`
+                -- in the prefix strings. sub-and-equal is simpler and right.
+                if not matched then
+                    for _, prefix in ipairs(TOOLTIP_EXTRA_PREFIXES) do
+                        if text:sub(1, #prefix) == prefix then
+                            -- v0.32: skip Equip lines that are pure stat
+                            -- descriptions — GetItemStats already captured
+                            -- the numeric value into entry.stats; duplicating
+                            -- the raw text would double-render on the site.
+                            if not (prefix == "Equip:" and IsStatLikeEquipLine(text)) then
+                                extras = extras or {}
+                                extras[#extras + 1] = text
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return stats, extras, setBonuses, damage, speed
+end
 
 local function now() return GetTime() end
 
@@ -247,8 +569,8 @@ local function CacheItemInfo(itemID, itemLink)
     -- with the original ITEM_MOD_* keys so the site's ingest can map them
     -- via the same enum used for TDB merging. Random suffix variants are
     -- ignored per spec — first roll wins for a given itemID.
+    local link = itemLink or ("item:" .. itemID)
     if GetItemStats then
-        local link = itemLink or ("item:" .. itemID)
         local stats = GetItemStats(link)
         if stats then
             local serial = {}
@@ -264,6 +586,29 @@ local function CacheItemInfo(itemID, itemLink)
             end
         end
     end
+
+    -- v0.26+: tooltip-scan. Returns five fields:
+    --   tooltipStats  — percent-based / pre-rating stats (Darkmantle "+1%
+    --                   crit", Rival's "+3% player damage") that GetItemStats
+    --                   doesn't expose in its enum.
+    --   tooltipExtras — raw flavor/proc lines like Eskhandar's "Chance on
+    --                   hit: Slows enemy's movement by 60%..." which aren't
+    --                   numeric stats but belong on the armory tooltip.
+    --   setBonuses    — each "Set:" / "(N) Set:" line as { pieces, text }.
+    --                   Same bonus block appears on every item in the set;
+    --                   site-side can dedup by itemSet later.
+    --   damage        — weapon damage range { min, max, school? } (GetItemStats
+    --                   only exposes DPS; the min/max and elemental school
+    --                   live only in tooltip text).
+    --   speed         — weapon attack speed as a decimal (e.g. 2.8).
+    -- Any may be nil if not applicable to the item; site's ingest handles
+    -- each in its own display path.
+    local tooltipStats, tooltipExtras, setBonuses, damage, speed = ScanTooltip(link)
+    if tooltipStats  then entry.tooltipStats  = tooltipStats  end
+    if tooltipExtras then entry.tooltipExtras = tooltipExtras end
+    if setBonuses    then entry.setBonuses    = setBonuses    end
+    if damage        then entry.damage        = damage        end
+    if speed         then entry.speed         = speed         end
 
     EpogItemCacheDB[itemID] = entry
     return true
@@ -403,6 +748,12 @@ local function BuildPayload(unit, guid)
     local s1, s2, s3 = ReadSpecPoints(unit)
     local dominantTree = DominantTree({s1, s2, s3})
     local tabNames, tabIcons = ReadTabInfo(unit)
+    -- v0.33: PvP loadouts (Insignia trinket equipped) get routed to
+    -- sets["pvp"] on the player record instead of sets[dominantTree].
+    -- Group key is stringified: "1" / "2" / "3" / "pvp". Receivers compute
+    -- their own group locally from entry.gear, so the wire value is mostly
+    -- informational/forward-compat.
+    local groupKey = UnitLooksPvP(unit) and "pvp" or tostring(dominantTree)
 
     local parts = {
         "v" .. PROTO,
@@ -454,7 +805,7 @@ local function BuildPayload(unit, guid)
     -- Append dominant-tree index at position 31 (per v0.7 append-only rule).
     -- v0.14+ receivers actually compute this locally from entry.spec, so the
     -- field is informational/forward-compat only. Old v0.12 clients ignore it.
-    parts[#parts + 1] = tostring(dominantTree)
+    parts[#parts + 1] = groupKey -- v0.33: "1"/"2"/"3" or "pvp" (was dominantTree numeric)
     -- Tab names at positions 32/33/34 so receivers can render class-tree
     -- labels that match the sender's actual client layout (Ascension reorders
     -- some classes vs retail WotLK). Older clients ignore the trailing fields.
@@ -593,7 +944,12 @@ local function ParsePayload(payload)
         scanTime    = tonumber(t[10]) or 0,
         zone        = t[11] or "",
         gear        = {},
-        talentGroup = tonumber(t[31]) or 1, -- v0.13+: position 31 is active talent group; v0.12 payloads default to 1
+        -- Position 31 — v0.13+ carries the sender's group key. Value is
+        -- numeric "1"/"2"/"3" for class trees or "pvp" for PvP loadouts
+        -- (v0.33+). Kept as a string here for forward-compat; Ingest
+        -- computes its own group key locally from entry.gear + spec, so
+        -- this field is informational only.
+        groupKey    = t[31] or "1",
     }
     for i = 1, 19 do entry.gear[i] = t[11 + i] or "" end
     -- v0.17+: positions 32/33/34 carry class tab names ("Combat",
@@ -636,10 +992,17 @@ local function Ingest(payload, sender)
     EpogArmoryDB = EpogArmoryDB or { meta = { version = 1, created = time() }, players = {}, lastScanned = {}, config = {} }
     EpogArmoryDB.players = EpogArmoryDB.players or {}
 
-    -- Set key = dominant tree (1=Arms/Assassination/etc, 2=Fury/Combat/..., 3=Prot/Subtlety/...).
-    -- Computed locally from entry.spec, NOT read from wire position 31, so
-    -- we're robust against sender bugs or clients using a different keying.
-    local group = DominantTree(entry.spec)
+    -- Set key — computed locally, NOT read from wire position 31, so we're
+    -- robust against sender bugs and older clients that key differently.
+    -- If the scanned player has an Insignia trinket equipped (slot 13/14)
+    -- the loadout is a PvP set and routes to sets["pvp"]. Otherwise it goes
+    -- to sets[DominantTree(spec)] for 1/2/3 class-tree keying.
+    local group
+    if EntryGearLooksPvP(entry.gear) then
+        group = "pvp"
+    else
+        group = DominantTree(entry.spec)
+    end
     local scannedBy = sender or (UnitName("player") or "?")
     local existing = EpogArmoryDB.players[entry.guid]
 
@@ -1326,6 +1689,51 @@ SlashCmdList["EPOGARMORY"] = function(msg)
         local s1, s2, s3 = ReadSpecPoints("player")
         print(string.format("  ReadSpecPoints(player) = %d / %d / %d → DominantTree = %d",
             s1, s2, s3, DominantTree({s1, s2, s3})))
+    elseif msg:sub(1, 9) == "dumpstats" then
+        -- Diagnostic: print GetItemStats + tooltip lines for equipped slots.
+        -- Lets us see exactly which keys Ascension's client returns for a
+        -- problem item (e.g. items with percent-based custom stats that might
+        -- or might not be in the standard ITEM_MOD_* enum). Usage:
+        --   /epogarmory dumpstats        → all 19 slots
+        --   /epogarmory dumpstats 10     → just hands
+        local arg = msg:match("^dumpstats%s+(%d+)")
+        local target = tonumber(arg)
+        local slots = target and { target } or {1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19} -- skip 4=shirt
+        local tip = CreateFrame("GameTooltip", "EpogArmoryDumpStatsTip", UIParent, "GameTooltipTemplate")
+        tip:SetOwner(UIParent, "ANCHOR_NONE")
+        for _, slot in ipairs(slots) do
+            local link = GetInventoryItemLink("player", slot)
+            if link then
+                local name = GetItemInfo(link) or "?"
+                print(string.format("|cffffaa44EpogArmory|r slot %d [%s]", slot, name))
+                local stats = GetItemStats and GetItemStats(link)
+                if stats then
+                    local anyKey = false
+                    for k, v in pairs(stats) do
+                        anyKey = true
+                        print(string.format("    GetItemStats: %s = %s", tostring(k), tostring(v)))
+                    end
+                    if not anyKey then print("    GetItemStats: <empty table>") end
+                else
+                    print("    GetItemStats: <nil>")
+                end
+                -- Tooltip-line scan for comparison. Captures lines that
+                -- include a percent or a common stat keyword.
+                tip:ClearLines()
+                tip:SetHyperlink(link)
+                local dumped = 0
+                for i = 2, tip:NumLines() do -- skip line 1 (item name, already printed)
+                    local fs = _G["EpogArmoryDumpStatsTipTextLeft" .. i]
+                    local text = fs and fs:GetText() or ""
+                    if text ~= "" and (text:find("%%") or text:lower():find("rating") or text:lower():find("increas") or text:lower():find("reduc") or text:lower():find("improv") or text:find("^%+%d")) then
+                        print(string.format("    tip%2d: %s", i, text))
+                        dumped = dumped + 1
+                    end
+                end
+                if dumped == 0 then print("    tooltip: <no stat-like lines matched>") end
+            end
+        end
+        tip:Hide()
     else
         ShowHelp()
     end
