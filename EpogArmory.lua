@@ -193,6 +193,46 @@ local versionPingAt      = 0
 local versionPingSent    = false
 local versionNotified    = false
 
+-- Admin sync protocol (v0.35): a targeted peer can request another peer's
+-- recent stored scans for bulk-catch-up. Hidden slash command:
+--   /epogarmory syncfrom <playerName> [days]
+-- Receiver broadcasts a SYNCREQ; the named target replays their stored
+-- set.rawPayload blobs back through the normal outQueue. Other guildmates
+-- ingest the replays too (free benefit — their DBs also catch up).
+local SYNC_RESPONSE_COOLDOWN     = 3600        -- 1h per requester
+local SYNC_MAX_SETS_PER_RESPONSE = 200         -- cap drain at ~20min even for huge DBs
+local lastSyncResponseTo         = {}          -- in-memory: requesterName -> time() of last response
+
+-- v0.37: requester-side cap — 3 concurrent outgoing syncs max. Each tracked
+-- with an estimated end time (~25 min per sync, conservative vs the 20 min
+-- full-drain at MAX_SETS_PER_RESPONSE). UI greys rows while a sync is
+-- active. Tracker is in-memory; /reload resets it (which also wipes
+-- outQueue, so both sides stay consistent).
+local SYNC_MAX_CONCURRENT = 3
+local SYNC_EST_DURATION   = 25 * 60
+local activeSyncs         = {} -- peerName -> estimatedEndTime
+
+-- v0.37: responder-side defense-in-depth. Global cooldown across ALL sync
+-- responses means even a multi-attacker bomb (10 requesters from 10 alts)
+-- only triggers ONE response per 15 min. Combined with the per-requester
+-- 1h cooldown, caps the victim's outQueue load at one 20-min drain at a
+-- time, not N × drain in parallel.
+local SYNC_GLOBAL_COOLDOWN = 900 -- 15 min between any sync responses
+local lastSyncResponseAt   = 0   -- any-peer global timestamp of last response
+
+local function CleanExpiredSyncs()
+    local t = time()
+    for name, endT in pairs(activeSyncs) do
+        if endT <= t then activeSyncs[name] = nil end
+    end
+end
+local function CountActiveSyncs()
+    CleanExpiredSyncs()
+    local n = 0
+    for _ in pairs(activeSyncs) do n = n + 1 end
+    return n
+end
+
 -- item-info cache. EpogItemCacheDB is the persistent half; pendingCache
 -- is the in-memory retry queue for items the client hasn't fetched yet.
 local pendingCache = {} -- itemID -> firstSeenTime
@@ -817,6 +857,15 @@ local function BuildPayload(unit, guid)
     parts[#parts + 1] = tabIcons[1]
     parts[#parts + 1] = tabIcons[2]
     parts[#parts + 1] = tabIcons[3]
+    -- v0.36: piggyback our local DB size (count of stored players) so the
+    -- browser's Scanners view can show peers ordered by "how much data they
+    -- have to share". Cheap — one small integer per broadcast, always
+    -- additive at the tail per the append-only wire rule.
+    local dbSize = 0
+    if EpogArmoryDB and EpogArmoryDB.players then
+        for _ in pairs(EpogArmoryDB.players) do dbSize = dbSize + 1 end
+    end
+    parts[#parts + 1] = tostring(dbSize)
     return table.concat(parts, "^"), equipped
 end
 
@@ -963,6 +1012,12 @@ local function ParsePayload(payload)
     if t[35] and t[35] ~= "" then
         entry.tabIcons = { t[35] or "", t[36] or "", t[37] or "" }
     end
+    -- v0.36+: position 38 carries the sender's own DB size (count of stored
+    -- players). Used by the browser's Scanners view to rank peers by "how
+    -- much data they have to share". Absent on older payloads.
+    if t[38] and t[38] ~= "" then
+        entry.senderDBSize = tonumber(t[38])
+    end
     if entry.name == "" or entry.guid == "" then return nil end
     return entry
 end
@@ -978,6 +1033,18 @@ local function Ingest(payload, sender)
     -- so the 24h dedup works across the full mesh — even if this particular
     -- scan fails ShouldStore (utility gear, wrong zone, etc).
     MarkInspected(entry.guid, entry.scanTime)
+
+    -- v0.36: record the sender's reported DB size. Persisted in
+    -- EpogArmoryDB.peerInfo so the Scanners view works immediately on
+    -- login (before any fresh broadcasts arrive) based on the latest
+    -- counts we heard last session.
+    if entry.senderDBSize and sender and sender ~= "" and sender ~= UnitName("player") then
+        EpogArmoryDB.peerInfo = EpogArmoryDB.peerInfo or {}
+        EpogArmoryDB.peerInfo[sender] = {
+            dbSize   = entry.senderDBSize,
+            lastSeen = entry.scanTime or time(),
+        }
+    end
 
     -- Populate the item-info cache from every scan we observe — even rejected
     -- ones give us valid itemIDs to enrich our DB.
@@ -1029,11 +1096,16 @@ local function Ingest(payload, sender)
     if entry.tabNames then existing.tabNames = entry.tabNames end -- v0.17+
     if entry.tabIcons then existing.tabIcons = entry.tabIcons end -- v0.18+
     existing.sets[group] = {
-        spec      = entry.spec,
-        gear      = entry.gear,
-        scanTime  = entry.scanTime,
-        zone      = entry.zone,
-        scannedBy = scannedBy,
+        spec       = entry.spec,
+        gear       = entry.gear,
+        scanTime   = entry.scanTime,
+        zone       = entry.zone,
+        scannedBy  = scannedBy,
+        -- v0.35: stash the raw wire payload so an admin running
+        -- /epogarmory syncfrom <us> can replay it verbatim without
+        -- having to reconstruct the wire format from structured fields.
+        -- Keeps the sync protocol drift-proof as BuildPayload evolves.
+        rawPayload = payload,
     }
 
     -- Mirror the most-recently-scanned set to top-level fields for
@@ -1119,6 +1191,83 @@ local function TrySendVersionPing()
         ADDON_VERSION, table.concat(channels, "+")))
 end
 
+-- v0.35: handle an incoming SYNCREQ. Only responds if:
+--   1. The request targets this client specifically (by name match)
+--   2. Arrived on GUILD channel (so we're not responding to random whispers)
+--   3. We haven't responded to this requester within SYNC_RESPONSE_COOLDOWN
+-- When responding, we iterate stored sets with scanTime > sinceTS and replay
+-- their raw wire payloads via the outQueue — bounded to
+-- SYNC_MAX_SETS_PER_RESPONSE to cap drain duration. The normal 2s broadcast
+-- stagger paces these so the guild channel isn't saturated.
+local function HandleSyncRequest(payload, sender, channel)
+    -- v0.37: accept from guild, party, or raid. Same trust envelope — WoW
+    -- fills in sender name on receive, and addon-messages on these channels
+    -- are only deliverable by peers actually in that group/guild.
+    if channel ~= "GUILD" and channel ~= "PARTY" and channel ~= "RAID" then
+        dprint(string.format("[sync] ignore request from %s — bad channel (%s)", sender or "?", channel or "?"))
+        return
+    end
+    local tag, requester, target, sinceStr = strsplit("^", payload)
+    if tag ~= "SYNCREQ" then return end
+    if not target or target == "" then return end
+    if target ~= UnitName("player") then
+        -- Request is for someone else; silently ignore.
+        return
+    end
+    -- v0.37: user-toggleable opt-out. Default is to accept; syncoff disables
+    -- responding entirely for the rest of the session (until /reload or
+    -- re-toggle). Useful as emergency escape if getting sync-bombed.
+    if EpogArmoryDB and EpogArmoryDB.config and EpogArmoryDB.config.acceptSync == false then
+        dprint(string.format("[sync] decline %s — user has syncoff enabled", requester or "?"))
+        return
+    end
+    -- v0.37: global response cooldown — caps aggregate outQueue load even
+    -- when multiple attackers each have their own per-requester cooldown
+    -- slots. One response per 15 min across all requesters.
+    if (time() - lastSyncResponseAt) < SYNC_GLOBAL_COOLDOWN then
+        dprint(string.format("[sync] decline %s — global cooldown (%.1fm since last response)",
+            requester or "?", (time() - lastSyncResponseAt) / 60))
+        return
+    end
+    -- Rate-limit per requester to prevent a single requester from looping.
+    local last = lastSyncResponseTo[requester or ""] or 0
+    if (time() - last) < SYNC_RESPONSE_COOLDOWN then
+        dprint(string.format("[sync] decline %s — responded %.1fh ago (cooldown 1h)",
+            requester or "?", (time() - last) / 3600))
+        return
+    end
+    local sinceTS = tonumber(sinceStr) or 0
+    if not (EpogArmoryDB and EpogArmoryDB.players) then return end
+
+    local queued = 0
+    for _, p in pairs(EpogArmoryDB.players) do
+        if queued >= SYNC_MAX_SETS_PER_RESPONSE then break end
+        if p.sets then
+            for _, set in pairs(p.sets) do
+                if queued >= SYNC_MAX_SETS_PER_RESPONSE then break end
+                if set.rawPayload and (set.scanTime or 0) > sinceTS then
+                    -- Chunk + enqueue with a fresh msgID so receivers see
+                    -- this as a new broadcast (different assembly key).
+                    msgCounter = msgCounter + 1
+                    local msgID = string.format("%x%x",
+                        math.floor(now() * 10) % 0xffff, msgCounter % 0xffff)
+                    local chunks = MakeChunks(set.rawPayload, msgID)
+                    for _, chunk in ipairs(chunks) do
+                        outQueue[#outQueue + 1] = { ch = "GUILD", body = chunk }
+                    end
+                    queued = queued + 1
+                end
+            end
+        end
+    end
+    lastSyncResponseTo[requester or ""] = time()
+    lastSyncResponseAt = time() -- v0.37: stamp global cooldown
+    dprint(string.format("[sync] responding to %s: queued %d sets since %s (max %d)",
+        requester or "?", queued,
+        sinceTS > 0 and date("%Y-%m-%d %H:%M", sinceTS) or "epoch",
+        SYNC_MAX_SETS_PER_RESPONSE))
+end
+
 local function OnAddonMessage(prefix, body, channel, sender)
     if prefix ~= PREFIX then return end
     -- Drop our own echoes. Addon messages broadcast on GUILD/PARTY/RAID always
@@ -1160,6 +1309,8 @@ local function OnAddonMessage(prefix, body, channel, sender)
         -- framing but decode to a different shape.
         if full:sub(1, 4) == "VER^" then
             HandleVersionPing(full, sender)
+        elseif full:sub(1, 8) == "SYNCREQ^" then
+            HandleSyncRequest(full, sender, channel)
         else
             Ingest(full, sender)
         end
@@ -1460,8 +1611,13 @@ f:SetScript("OnEvent", function(self, event, ...)
         EpogArmoryDB.players     = EpogArmoryDB.players     or {}
         EpogArmoryDB.lastScanned = EpogArmoryDB.lastScanned or {}
         EpogArmoryDB.config      = EpogArmoryDB.config      or {}
+        EpogArmoryDB.peerInfo    = EpogArmoryDB.peerInfo    or {}
         if EpogArmoryDB.config.requireInstance == nil then
             EpogArmoryDB.config.requireInstance = true
+        end
+        -- v0.37: responder-side sync opt-in defaults to true.
+        if EpogArmoryDB.config.acceptSync == nil then
+            EpogArmoryDB.config.acceptSync = true
         end
         requireInstance = EpogArmoryDB.config.requireInstance
         EpogItemCacheDB = EpogItemCacheDB or {}
@@ -1519,8 +1675,23 @@ local function CountPending()
     return n
 end
 
--- Public namespace entry used by the UI's Delete button. Clears one player
--- from the local DB so the mesh can refill on the next scan from any peer.
+-- Public namespace — used by the UI for cross-file access to helpers that
+-- need to live in EpogArmory.lua (for scoping / state reasons).
+_G.EpogArmory = _G.EpogArmory or {}
+
+-- v0.37: expose sync-state accessors for the UI's Scanners view.
+_G.EpogArmory.IsPeerSyncActive = function(name)
+    CleanExpiredSyncs()
+    return activeSyncs[name] ~= nil
+end
+_G.EpogArmory.SyncEndTimeFor = function(name)
+    CleanExpiredSyncs()
+    return activeSyncs[name]
+end
+_G.EpogArmory.ActiveSyncCount = function()
+    return CountActiveSyncs()
+end
+_G.EpogArmory.SyncMaxConcurrent = SYNC_MAX_CONCURRENT
 -- Also resets the 24h HasFreshScan gate for this GUID (by wiping
 -- lastScanned[guid]) and the in-memory 15min inspect cooldown (seen[guid]),
 -- so *this client* can re-inspect immediately if they're in range. If the
@@ -1689,6 +1860,75 @@ SlashCmdList["EPOGARMORY"] = function(msg)
         local s1, s2, s3 = ReadSpecPoints("player")
         print(string.format("  ReadSpecPoints(player) = %d / %d / %d → DominantTree = %d",
             s1, s2, s3, DominantTree({s1, s2, s3})))
+    elseif msg:sub(1, 8) == "syncfrom" then
+        -- Hidden admin command: request another peer to replay their recent
+        -- stored scans. v0.37: extended to party + raid + guild channels.
+        -- Usage:
+        --   /epogarmory syncfrom <playerName>         (default: last 7 days)
+        --   /epogarmory syncfrom <playerName> 30      (last 30 days)
+        --   /epogarmory syncfrom <playerName> 0       (everything the peer has)
+        -- Capped at SYNC_MAX_CONCURRENT (3) simultaneous active syncs so the
+        -- inbound data stream stays manageable.
+        local argStr = msg:sub(10) -- everything after "syncfrom "
+        local name, daysStr = argStr:match("^%s*(%S+)%s*(%S*)%s*$")
+        if not name or name == "" then
+            print("|cffffaa44EpogArmory|r: usage — /epogarmory syncfrom <playerName> [days]")
+            return
+        end
+        -- Canonical name casing (peer compares UnitName("player") == name exactly)
+        name = name:sub(1, 1):upper() .. name:sub(2):lower()
+        -- Active-sync cap (requester side).
+        CleanExpiredSyncs()
+        if activeSyncs[name] then
+            local remain = math.max(0, activeSyncs[name] - time())
+            print(string.format("|cffffaa44EpogArmory|r: already syncing from |cff00ff00%s|r — ~%dm remaining",
+                name, math.ceil(remain / 60)))
+            return
+        end
+        if CountActiveSyncs() >= SYNC_MAX_CONCURRENT then
+            print(string.format("|cffffaa44EpogArmory|r: already at %d concurrent syncs. Wait for one to finish (each takes ~25 min).",
+                SYNC_MAX_CONCURRENT))
+            return
+        end
+        local days = tonumber(daysStr) or 7
+        local sinceTS = days > 0 and (time() - days * 86400) or 0
+        local channels = PickChannels()
+        if #channels == 0 then
+            print("|cffffaa44EpogArmory|r: sync requires being in a guild or group (request is sent via addon-message channel)")
+            return
+        end
+        msgCounter = msgCounter + 1
+        local msgID = string.format("S%x", msgCounter % 0xffff)
+        local body = string.format("%s^1^1^SYNCREQ^%s^%s^%d",
+            msgID, UnitName("player") or "?", name, sinceTS)
+        for _, ch in ipairs(channels) do
+            outQueue[#outQueue + 1] = { ch = ch, body = body }
+        end
+        activeSyncs[name] = time() + SYNC_EST_DURATION
+        print(string.format("|cffffaa44EpogArmory|r: requested sync from |cff00ff00%s|r (last %d days) via %s. ETA ~25 min.",
+            name, days, table.concat(channels, "+")))
+        -- Refresh the browser scanners view if it's open so the row dims.
+        if _G.EpogArmoryBrowserFrame and _G.EpogArmoryBrowserFrame:IsShown()
+            and _G.EpogArmoryBrowserFrame.Refresh then
+            _G.EpogArmoryBrowserFrame.Refresh()
+        end
+    elseif msg == "syncoff" or msg == "syncon" then
+        -- Toggle the responder-side opt-out. When "off", we refuse any
+        -- incoming SYNCREQ regardless of requester. Persists in
+        -- EpogArmoryDB.config.acceptSync.
+        EpogArmoryDB = EpogArmoryDB or {}
+        EpogArmoryDB.config = EpogArmoryDB.config or {}
+        if msg == "syncoff" then
+            EpogArmoryDB.config.acceptSync = false
+            print("|cffffaa44EpogArmory|r: sync-response |cffff6666OFF|r — will refuse incoming SYNCREQ. /epogarmory syncon to re-enable.")
+        else
+            EpogArmoryDB.config.acceptSync = true
+            print("|cffffaa44EpogArmory|r: sync-response |cff00ff66ON|r — accepting incoming SYNCREQ again.")
+        end
+        if _G.EpogArmoryBrowserFrame and _G.EpogArmoryBrowserFrame:IsShown()
+            and _G.EpogArmoryBrowserFrame.Refresh then
+            _G.EpogArmoryBrowserFrame.Refresh()
+        end
     elseif msg:sub(1, 9) == "dumpstats" then
         -- Diagnostic: print GetItemStats + tooltip lines for equipped slots.
         -- Lets us see exactly which keys Ascension's client returns for a
