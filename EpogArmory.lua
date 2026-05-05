@@ -205,6 +205,21 @@ local MOUNT_ENCHANT_SLOTS = { 8, 10 } -- feet, hands
 -- you), so self-scans aren't gated.
 local REALITY_AURA_NAME = "Reality Recalibrators"
 
+-- Claude (v1.4.1 → v1.4.6): toggle the auto-inspect gating on the Reality
+-- Recalibrators aura. When false, all three interlock points (BuildPayload,
+-- ScanRoster, TryInspect) skip the aura check and let scans proceed.
+--
+-- v1.4.1 test result (validated on Epoch): the 400ms settle + 1.5s verify
+-- pass is NOT sufficient on its own — Ascension/Epoch's transmog override
+-- holds the cosmetic itemID well past those windows for inspected players,
+-- so without the aura we just broadcast junk. Re-enabled the interlock as
+-- the only way to get real gear data.
+--
+-- Flag kept (rather than removed) so we can re-test if server behavior
+-- changes — flipping false is a one-line revert. Diagnostic surfaces
+-- (status command, browser banner, minimap tooltip) still honor the flag.
+local REQUIRE_REALITY_AURA = true
+
 -- v1.1.7+: track whether we've ever seen the aura active this session.
 -- Used to suppress the "aura not active" hint for users who clearly
 -- know about it (avoids false-positive nags during zone transitions
@@ -1282,6 +1297,149 @@ end
 -- every itemID where the inspector's local GetItemInfo has data. Right
 -- after a successful inspect, the SMSG_INSPECT_RESULTS response has
 -- populated the dynamic cache for those items, so GetItemInfo + GetItemStats
+-- Claude (v1.4.4): capture live character stats at scan time. Item-only
+-- aggregation misses everything that isn't a flat slot stat:
+--   - race+level base attribute values
+--   - class AP formulas (warrior STR×2, hunter AGI×2, etc.)
+--   - weapon damage with AP scaling
+--   - buff/debuff effects active during the scan
+--   - talent multipliers (e.g., Toughness +Stamina)
+-- UnitStat / UnitArmor / UnitAttackPower / UnitDamage all work on
+-- inspected unit tokens (party/raid). The player-only APIs (GetCritChance,
+-- GetCombatRatingBonus, GetSpellBonusDamage) only fire when scanning self.
+-- For inspect-scans the panel falls back to derived-from-item-ratings for
+-- those fields.
+local function CapturePlayerStats(unit)
+    local out = {}
+    -- Effective stat (index 2 of UnitStat) matches what the Character pane
+    -- shows in the white "Strength: 74" line — base + items + buffs + talents.
+    local _, str = UnitStat(unit, 1)
+    local _, agi = UnitStat(unit, 2)
+    local _, sta = UnitStat(unit, 3)
+    local _, intel = UnitStat(unit, 4)
+    local _, spi = UnitStat(unit, 5)
+    out.str = str or 0
+    out.agi = agi or 0
+    out.sta = sta or 0
+    out.int = intel or 0
+    out.spi = spi or 0
+    -- Effective armor (index 2) includes base+items+buffs (e.g., Inner Fire).
+    local _, effArmor = UnitArmor(unit)
+    out.armor = effArmor or 0
+    -- AP: sum the three returns. UnitAttackPower returns base, posBuff, negBuff.
+    local apB, apP, apN = UnitAttackPower(unit)
+    out.mAP = (apB or 0) + (apP or 0) + (apN or 0)
+    local rapB, rapP, rapN = UnitRangedAttackPower(unit)
+    out.rAP = (rapB or 0) + (rapP or 0) + (rapN or 0)
+    -- Weapon damage range (UnitDamage returns minDmg, maxDmg as floats).
+    if UnitDamage then
+        local minD, maxD = UnitDamage(unit)
+        if minD and maxD and minD > 0 then
+            out.wMin = math.floor(minD + 0.5)
+            out.wMax = math.floor(maxD + 0.5)
+        end
+    end
+    -- Player-only stats: combat ratings and crit chances only respond to
+    -- the implicit "player" unit. Skip for inspect-scans of others; the
+    -- UI falls back to item-rating sums on the receive side.
+    if UnitIsUnit(unit, "player") then
+        if GetCritChance        then out.mCrit = GetCritChance() end
+        if GetRangedCritChance  then out.rCrit = GetRangedCritChance() end
+        if GetSpellCritChance   then out.sCrit = GetSpellCritChance(2) end -- fire school = typical caster value
+        if GetCombatRatingBonus then
+            -- These rating-bonus values are correct for Hit/Haste/Expertise:
+            -- the character pane's displayed % for those is rating-derived
+            -- (talents/racials add their own line in the tooltip but the
+            -- top-line % is from rating).
+            out.mHit  = GetCombatRatingBonus(6)  -- CR_HIT_MELEE
+            out.rHit  = GetCombatRatingBonus(7)  -- CR_HIT_RANGED
+            out.sHit  = GetCombatRatingBonus(8)  -- CR_HIT_SPELL
+            out.mHa   = GetCombatRatingBonus(18) -- CR_HASTE_MELEE
+            out.rHa   = GetCombatRatingBonus(19) -- CR_HASTE_RANGED
+            out.sHa   = GetCombatRatingBonus(20) -- CR_HASTE_SPELL
+            out.exp   = GetCombatRatingBonus(24) -- CR_EXPERTISE
+            out.res   = GetCombatRatingBonus(15) -- CR_CRIT_TAKEN_MELEE ≈ resilience
+            out.arp   = GetCombatRatingBonus(25) -- CR_ARMOR_PENETRATION
+        end
+        -- Claude (v1.4.5): defense-side totals. GetCombatRatingBonus(3/4/5)
+        -- only returns the rating-derived bonus; a Hunter with no dodge
+        -- rating still has ~4-5% dodge from base Agility, which the v1.4.4
+        -- code was displaying as 0%. The Get*Chance APIs return the full
+        -- dodge/parry/block including base, items, buffs, talents — which
+        -- is what the in-game character pane shows.
+        if GetDodgeChance then out.dod = GetDodgeChance() end
+        if GetParryChance then out.par = GetParryChance() end
+        if GetBlockChance then out.blk = GetBlockChance() end
+        -- Defense skill: UnitDefense("player") returns (base, modifier)
+        -- where base is the level-scaled minimum and modifier is the
+        -- bonus from defense-rating items + talents. Stored as the raw
+        -- skill total so the panel can display "(N skill)" similar to
+        -- the in-game tooltip.
+        if UnitDefense then
+            local defBase, defMod = UnitDefense("player")
+            out.def = (defBase or 0) + (defMod or 0)
+        end
+        if GetSpellBonusDamage then
+            local maxSP = 0
+            for school = 1, 7 do
+                local sp = GetSpellBonusDamage(school) or 0
+                if sp > maxSP then maxSP = sp end
+            end
+            out.sp = maxSP
+        end
+        if GetSpellBonusHealing then out.hp = GetSpellBonusHealing() or 0 end
+        if GetManaRegen then
+            local _, casting = GetManaRegen()
+            out.mp5 = math.floor(((casting or 0) * 5) + 0.5)
+        end
+    end
+    return out
+end
+
+-- Claude (v1.4.4): wire encoding for the stats blob. Compact key=value list
+-- separated by commas. Numeric values truncated to 2 decimals to keep
+-- the payload short. Wire-control chars (^|=,) are not legal in keys
+-- or values by construction (we only emit short ASCII keys + numeric
+-- values), so no escaping needed.
+local STATS_KEY_ORDER = {
+    "str","agi","sta","int","spi","armor",
+    "mAP","rAP","wMin","wMax",
+    "mCrit","rCrit","sCrit",
+    "mHit","rHit","sHit",
+    "mHa","rHa","sHa",
+    "exp","dod","par","blk","res","arp","def",
+    "sp","hp","mp5",
+}
+local function EncodeCharStats(stats)
+    if not stats then return "" end
+    local parts = {}
+    for _, k in ipairs(STATS_KEY_ORDER) do
+        local v = stats[k]
+        if v and v ~= 0 then
+            -- 2-decimal precision is plenty for stats: 6.00% / 13.67% / 368.5
+            parts[#parts + 1] = string.format("%s=%.2f", k, v)
+        end
+    end
+    return table.concat(parts, ",")
+end
+
+-- Claude (v1.4.4): inverse of EncodeCharStats. Returns a stats table or
+-- nil if blob is empty/malformed (defensive — older payloads have no
+-- field 43, and we don't want a malformed blob to error the whole parse).
+local function ParseCharStats(blob)
+    if not blob or blob == "" then return nil end
+    local out = {}
+    for pair in blob:gmatch("([^,]+)") do
+        local k, v = pair:match("^([%w_]+)=([%-%d%.]+)$")
+        if k and v then
+            local n = tonumber(v)
+            if n then out[k] = n end
+        end
+    end
+    if not next(out) then return nil end
+    return out
+end
+
 -- return Ascension's server-correct values. Receivers seed their cache
 -- from these hints and bypass the broken server-query path entirely.
 local function BuildItemInfoHints(unit)
@@ -1323,7 +1481,8 @@ local function BuildPayload(unit, guid)
     -- check). Self-scans pass: you always see your own real gear regardless
     -- of transmog. Other-unit scans require Reality Recalibrators because
     -- inspect APIs return transmog visuals on Ascension without it.
-    if not UnitIsUnit(unit, "player") and not HasRealityAura() then
+    -- v1.4.1: gate is conditional on REQUIRE_REALITY_AURA flag (test mode).
+    if REQUIRE_REALITY_AURA and not UnitIsUnit(unit, "player") and not HasRealityAura() then
         return nil, "Reality Recalibrators aura not active (transmog would override real gear)"
     end
     local realm = GetRealmName() or ""
@@ -1434,6 +1593,25 @@ local function BuildPayload(unit, guid)
     -- interactive talent tree on epoglogs.com. Format described at
     -- BuildTalentRanks. Backward compatible — pre-v1.3 receivers ignore.
     parts[#parts + 1] = BuildTalentRanks(unit)
+    -- Claude (v1.4.2): wire position 42 — scanner's guild name. Captured
+    -- from GetGuildInfo("player"). Receivers persist to peerInfo[name].guild
+    -- so the Scanners view in the Browser can show a Guild column. Empty
+    -- string when the scanner is unguilded. Strip wire-control chars
+    -- defensively (^ separator and | item-link escape) so a guild name
+    -- containing those can't break payload parsing downstream.
+    local myGuild = GetGuildInfo and GetGuildInfo("player") or ""
+    if type(myGuild) ~= "string" then myGuild = "" end
+    myGuild = myGuild:gsub("[%^|]", "")
+    parts[#parts + 1] = myGuild
+    -- Claude (v1.4.4): wire position 43 — live character stats from
+    -- UnitStat / UnitArmor / UnitAttackPower / UnitDamage. Lets the
+    -- receiver render real-character-pane numbers (base + items + buffs
+    -- + talents) in the Stats panel instead of pure-from-items sums.
+    -- For inspect-scans of others, only the unit-token-compatible stats
+    -- are present; player-only fields (crit/hit/haste/expertise %, spell
+    -- power, mp5) are skipped server-side and the UI falls back to
+    -- derived-from-rating sums on the receive side.
+    parts[#parts + 1] = EncodeCharStats(CapturePlayerStats(unit))
     -- v1.3: capture talent metadata locally for this class (name, icon,
     -- tier, column, maxRank per talent). Stored in EpogTalentTreeDB.
     -- Doesn't go on the wire — it's bulky and stable per-class. Each
@@ -1652,6 +1830,20 @@ local function ParsePayload(payload)
     if t[41] and t[41] ~= "" then
         entry.talentRanks = ParseTalentRanks(t[41])
     end
+    -- Claude (v1.4.2): wire position 42 — scanner's guild name. Used by
+    -- Ingest to populate peerInfo[name].guild for the Scanners view's
+    -- Guild column. Absent on pre-v1.4.2 payloads / unguilded scanners.
+    if t[42] and t[42] ~= "" then
+        entry.senderGuild = t[42]
+    end
+    -- Claude (v1.4.4): wire position 43 — live character stats blob
+    -- (UnitStat-derived). Stored on the set so the Stats panel can show
+    -- real character-pane values instead of pure-from-items sums.
+    -- Absent on pre-v1.4.4 payloads; UI falls back to item-sum aggregation
+    -- when entry.charStats is nil.
+    if t[43] and t[43] ~= "" then
+        entry.charStats = ParseCharStats(t[43])
+    end
     if entry.name == "" or entry.guid == "" then return nil end
     return entry
 end
@@ -1679,10 +1871,16 @@ local function Ingest(payload, sender)
     local effectiveScanner = (entry.senderMain ~= nil and entry.senderMain ~= "") and entry.senderMain or sender
     if entry.senderDBSize and effectiveScanner and effectiveScanner ~= "" and effectiveScanner ~= MyIdentity() then
         EpogArmoryDB.peerInfo = EpogArmoryDB.peerInfo or {}
+        -- Claude (v1.4.2): preserve any previously-known guild on the
+        -- existing peerInfo row so we don't blow it away when an old
+        -- pre-v1.4.2 client (no senderGuild) broadcasts. Only overwrite
+        -- when the new payload actually carries a guild value.
+        local prevGuild = (EpogArmoryDB.peerInfo[effectiveScanner] and EpogArmoryDB.peerInfo[effectiveScanner].guild) or nil
         EpogArmoryDB.peerInfo[effectiveScanner] = {
             dbSize       = entry.senderDBSize,
             lastSeen     = entry.scanTime or time(),
             lastCharName = sender, -- character actually broadcasting (for reachability lookups)
+            guild        = entry.senderGuild or prevGuild, -- Claude (v1.4.2): for Scanners-view Guild column
         }
     end
 
@@ -1800,6 +1998,11 @@ local function Ingest(payload, sender)
         -- website's interactive talent tree. Receiver maps talent index →
         -- name/tier/column via class talent tree metadata.
         talentRanks = entry.talentRanks,
+        -- Claude (v1.4.4): live character stats from UnitStat-derived
+        -- snapshot at scan time (wire pos 43). Lets the Stats panel show
+        -- real character-pane values (base + items + buffs + talents)
+        -- instead of pure-from-items sums.
+        charStats = entry.charStats,
     }
 
     -- Mirror the most-recently-scanned set to top-level fields for
@@ -2230,7 +2433,8 @@ local function ScanRoster()
     -- "naked" or low-level cosmetics), not real gear — bypass so we don't
     -- pollute the mesh with junk scans. Show a one-time hint when the
     -- user has groupmates we'd otherwise be scanning.
-    if not HasRealityAura() then
+    -- v1.4.1: gate conditional on REQUIRE_REALITY_AURA (test mode).
+    if REQUIRE_REALITY_AURA and not HasRealityAura() then
         local hasGroup = (GetNumRaidMembers() > 0) or (GetNumPartyMembers() > 0)
         -- v1.1.7+: skip the hint entirely during the post-zone-change
         -- settle window. UnitBuff returns nothing for a few seconds after
@@ -2293,7 +2497,8 @@ local function TryInspect()
     -- — UnitBuff briefly returns nothing after PLAYER_ENTERING_WORLD
     -- even when the aura is active. Just hold the queue and retry next
     -- tick; auras restore within a few seconds.
-    if not HasRealityAura() then
+    -- v1.4.1: gate conditional on REQUIRE_REALITY_AURA (test mode).
+    if REQUIRE_REALITY_AURA and not HasRealityAura() then
         if InAuraSettleWindow() then
             dprint("[inspect] aura check skipped — within settle window (queue held)")
             nextInspectAt = now() + 1 -- recheck soon
@@ -2829,6 +3034,9 @@ _G.EpogArmory.MyIdentity = function() return MyIdentity() end
 -- instead of true gear, so we pause auto-scanning when missing.
 _G.EpogArmory.HasRealityAura = HasRealityAura
 _G.EpogArmory.RealityAuraName = REALITY_AURA_NAME
+-- Claude (v1.4.1 test): expose the test-mode flag so UI surfaces can
+-- accurately describe inspect behaviour when the aura is missing.
+_G.EpogArmory.RequiresRealityAura = function() return REQUIRE_REALITY_AURA end
 -- Also resets the 24h HasFreshScan gate for this GUID (by wiping
 -- lastScanned[guid]) and the in-memory 15min inspect cooldown (seen[guid]),
 -- so *this client* can re-inspect immediately if they're in range. If the
@@ -2930,8 +3138,11 @@ SlashCmdList["EPOGARMORY"] = function(msg)
         -- v1.2: surface aura status as part of the standard status output
         if HasRealityAura() then
             print(string.format("  |cff00ff66%s aura: ACTIVE|r — auto-inspect enabled", REALITY_AURA_NAME))
-        else
+        elseif REQUIRE_REALITY_AURA then
             print(string.format("  |cffff6666%s aura: NOT ACTIVE|r — auto-inspect of groupmates paused (transmog hides true gear)", REALITY_AURA_NAME))
+        else
+            -- Claude (v1.4.1 test): aura interlock disabled, scanning anyway to test settle+verify
+            print(string.format("  |cffffaa00%s aura: NOT ACTIVE|r — |cffff9966TEST MODE|r: scanning anyway (settle+verify validation)", REALITY_AURA_NAME))
         end
     elseif msg == "cache" then
         print(string.format("|cffffaa44EpogArmory|r cache: %d items known, %d pending client fetch",
@@ -3154,11 +3365,16 @@ SlashCmdList["EPOGARMORY"] = function(msg)
         if HasRealityAura() then
             print(string.format("|cffffaa44EpogArmory|r: |cff00ff66%s|r aura |cff00ff66ACTIVE|r — auto-inspect of groupmates enabled.",
                 REALITY_AURA_NAME))
-        else
+        elseif REQUIRE_REALITY_AURA then
             print(string.format("|cffffaa44EpogArmory|r: |cffff9966%s|r aura |cffff6666NOT ACTIVE|r — auto-inspect of groupmates is paused.",
                 REALITY_AURA_NAME))
             print("|cff888888  Without the aura, Ascension's transmog hides true gear from inspect. Self-scans still work normally.|r")
             realityAuraHintShown = false
+        else
+            -- Claude (v1.4.1 test): aura interlock disabled
+            print(string.format("|cffffaa44EpogArmory|r: |cffff9966%s|r aura |cffff6666NOT ACTIVE|r — |cffffaa00TEST MODE|r: scanning anyway.",
+                REALITY_AURA_NAME))
+            print("|cff888888  v1.4.1 test build: validating whether the 400ms settle + 1.5s verify pass is enough on its own to filter out transmog visual reads. Self-scans always work.|r")
         end
     elseif msg == "refreshpeers" or msg == "refresh" then
         -- v0.47: ask everyone in guild/group "give me your latest info".
