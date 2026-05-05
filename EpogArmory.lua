@@ -77,7 +77,9 @@ local MAX_CHUNK_BODY        = 200
 local ROSTER_TICK           = 10
 local MIN_INSPECT_LEVEL     = 60
 local MIN_STORE_LEVEL       = 60
-local MIN_STORE_EQUIPPED    = 10
+-- Claude: MIN_STORE_EQUIPPED removed in v1.3.3 — replaced by the per-slot
+-- CheckFullSet gate (defined near ItemStringFromLink), which requires every
+-- "useful" slot rather than a numeric threshold.
 local ASSEMBLY_TIMEOUT      = 60
 -- v0.34: reduced from 24h to 4h. AddUnit only ever fires for groupmates
 -- (called from ScanRoster's party/raid iteration), so this window controls
@@ -370,6 +372,12 @@ local CACHE_GIVE_UP        = 60
 --                          the dynamic cache; gives up after 3
 --      Existing v10 entries get re-validated on next observation.
 local CACHE_SCHEMA = 11
+
+-- Claude (v1.3.5): DB_SCHEMA_VERSION removed. The wipe-on-mismatch logic
+-- was throwing away accumulated mesh data on every breaking-shape bump —
+-- net negative UX. The wire format is already forward-compat (missing
+-- fields default via t[N] or X), and any real shape change should be
+-- handled by per-field migration in the read path, not by wiping.
 
 -- Tooltip-text patterns for percent-based stats that predate the rating
 -- system and aren't in GetItemStats' enum. Keys are plain uppercase tokens
@@ -667,6 +675,59 @@ local function ItemStringFromLink(link)
     if not link then return "" end
     local s = link:match("|Hitem:([%-%d:]+)|h")
     return s or ""
+end
+
+-- Claude: full-set gate. Refuse to broadcast or store inspects that are
+-- missing any "useful" slot — catches mid-equipment-swap moments where
+-- the player has briefly unequipped a weapon (or other gear) and the
+-- inspect happened during the gap. Slot 4 (shirt) and 19 (tabard) are
+-- disregarded as cosmetic. Slot 17 (offhand) is conditionally required:
+-- only when slot 16 doesn't hold a 2-hand weapon.
+local REQUIRED_GEAR_SLOTS = { 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18 }
+local GEAR_SLOT_NAMES = {
+    [1] = "head",     [2] = "neck",     [3] = "shoulder",
+    [5] = "chest",    [6] = "waist",    [7] = "legs",     [8] = "feet",
+    [9] = "wrist",    [10] = "hands",
+    [11] = "finger1", [12] = "finger2",
+    [13] = "trinket1",[14] = "trinket2",
+    [15] = "back",    [16] = "mainhand",[17] = "offhand", [18] = "ranged",
+}
+
+-- Claude: itemRef may be a link, an item-string ("12345:0:0:..."), or nil.
+-- Returns true if the item's equipLoc is INVTYPE_2HWEAPON. Returns false
+-- when nil, empty, or GetItemInfo can't resolve the item — that's the
+-- conservative answer (treats unknown as "not 2H", which forces the
+-- offhand requirement and rejects ambiguous payloads for retry).
+local function IsTwoHandRef(itemRef)
+    if not itemRef or itemRef == "" then return false end
+    local equipLoc
+    if type(itemRef) == "string" and itemRef:find("|H") then
+        equipLoc = select(9, GetItemInfo(itemRef))
+    else
+        local id = tonumber(tostring(itemRef):match("^(%d+)"))
+        if id then equipLoc = select(9, GetItemInfo(id)) end
+    end
+    return equipLoc == "INVTYPE_2HWEAPON"
+end
+
+-- Claude: gearLookup(slot) returns a link, item-string, or nil/"".
+-- Returns true if every required slot is filled (with the conditional
+-- offhand rule applied), false + reason otherwise.
+local function CheckFullSet(gearLookup)
+    for _, slot in ipairs(REQUIRED_GEAR_SLOTS) do
+        local v = gearLookup(slot)
+        if not v or v == "" then
+            return false, string.format("missing %s (slot %d)",
+                GEAR_SLOT_NAMES[slot] or "?", slot)
+        end
+    end
+    if not IsTwoHandRef(gearLookup(16)) then
+        local off = gearLookup(17)
+        if not off or off == "" then
+            return false, "missing offhand (slot 17, mainhand isn't 2H)"
+        end
+    end
+    return true
 end
 
 -- v1.2: scanner-side item-info hint encoding. Receivers on Ascension can't
@@ -1324,8 +1385,13 @@ local function BuildPayload(unit, guid)
             return nil, string.format("mount enchant '%s' on slot %d", bad, mountSlot)
         end
     end
-    if equipped < 10 then
-        return nil, string.format("only %d slots equipped (inspect data incomplete?)", equipped)
+    -- Claude: full-set gate. Mid-equipment-swap inspects often have a
+    -- weapon slot briefly empty — saving that snapshot would record an
+    -- incomplete loadout. Reject anything missing a required slot so the
+    -- short-retry path picks them up again with their full kit equipped.
+    local fullOk, fullReason = CheckFullSet(function(slot) return GetInventoryItemLink(unit, slot) end)
+    if not fullOk then
+        return nil, fullReason .. " (likely mid-swap, retry)"
     end
     -- Append dominant-tree index at position 31 (per v0.7 append-only rule).
     -- v0.14+ receivers actually compute this locally from entry.spec, so the
@@ -1472,12 +1538,13 @@ local function ShouldStore(entry)
     -- use spec distribution as a "committed player" gate here. The server-side
     -- validator in warcraftlogs-epog still has the final say on what gets
     -- published — we just collect everything gated by level + gear-equipped.
-    local equipped = 0
-    for i = 1, 19 do
-        if entry.gear[i] and entry.gear[i] ~= "" then equipped = equipped + 1 end
-    end
-    if equipped < MIN_STORE_EQUIPPED then
-        return false, string.format("only %d slots equipped", equipped)
+    -- Claude: full-set gate, mirrored from sender side. A peer running an
+    -- older addon (or a future bug) might broadcast an incomplete payload;
+    -- we refuse to persist anything that's missing a required slot so the
+    -- DB never contains half-swapped loadouts.
+    local fullOk, fullReason = CheckFullSet(function(slot) return entry.gear[slot] end)
+    if not fullOk then
+        return false, fullReason
     end
     for slot = 1, 19 do
         local s = entry.gear[slot]
@@ -2268,6 +2335,44 @@ local function CheckTimeout()
     end
 end
 
+-- Claude: gear-read settle window — Ascension's transmog layer can return
+-- the cosmetic appearance item ID for ~290ms after INSPECT_TALENT_READY
+-- instead of the real equipped item. We defer BuildPayload by 400ms so
+-- the server has time to resolve the real item before we read the slots.
+local INSPECT_SETTLE_DELAY = 0.4 -- Claude: seconds to wait after INSPECT_TALENT_READY before reading gear
+
+-- Claude: vanity-flip verify pass. Even after the 400ms settle, the transmog
+-- layer can flip individual slot links non-deterministically for another
+-- second or two. We re-read the inspected unit's slots at +1.5s post-settle
+-- and, if the gear fingerprint changed, broadcast the corrected payload.
+-- Receivers' SelfFingerprint dedup means duplicate broadcasts are cheap;
+-- a real flip just replaces the cached entry with the corrected one.
+local INSPECT_VERIFY_DELAY = 1.5 -- Claude: seconds after settle to re-read and verify slot links
+
+-- Claude: build a slot fingerprint from a unit's GetInventoryItemLink reads.
+-- Shared between initial-read capture and verify-pass comparison.
+local function InspectSlotFingerprint(unit)
+    local parts = {}
+    for slot = 1, 19 do
+        parts[slot] = ItemStringFromLink(GetInventoryItemLink(unit, slot))
+    end
+    return table.concat(parts, "|")
+end
+
+-- Claude (audit fix v1.3.4): WoW frames are never GC'd — they live forever
+-- in the C-side frame registry. Allocating a fresh CreateFrame inside
+-- OnInspectReady leaked one frame per inspect (and one per verify pass).
+-- These two module-level frames are recycled across all inspects: when a
+-- timer fires it sets OnUpdate=nil, when a new inspect needs the timer it
+-- assigns a fresh closure to OnUpdate. Per-inspect closures still capture
+-- their own snapUnit/snapGuid/elapsed locals, so reuse is safe. The
+-- settleFrame is naturally serialized (current stays set during 0.4s, so
+-- no second inspect can start). The verifyFrame can be clobbered if a
+-- new verify starts within 1.5s of an old one — that just silently skips
+-- the old verify, which is acceptable (initial broadcast already went out).
+local INSPECT_SETTLE_FRAME = CreateFrame("Frame")
+local INSPECT_VERIFY_FRAME = CreateFrame("Frame")
+
 local function OnInspectReady()
     if not current then return end
     -- v1.1: If the user opened the Blizzard inspect frame between our
@@ -2288,28 +2393,85 @@ local function OnInspectReady()
         ClearCurrent()
         return
     end
-    local tname = UnitName(c.unit) or "?"
-    local tlvl = UnitLevel(c.unit) or 0
-    local payload, info = BuildPayload(c.unit, c.guid)
-    if payload then
-        seen[c.guid] = now()
-        MarkInspected(c.guid, floor(time()))
-        dprint(string.format("[inspect] OK: %s L%d — %d slots equipped, payload %d bytes",
-            tname, tlvl, info, #payload))
-        EnqueueBroadcast(payload, tname)
-        -- direct-ingest our own scan so we save data even when no one
-        -- else is in our broadcast channels.
-        Ingest(payload, UnitName("player"))
-    else
-        -- incomplete inspect data (0-9 slots) is usually transient —
-        -- target moved out mid-response or server was slow. Short retry, not
-        -- the 15-min full cooldown which is reserved for successful scans.
-        markRetryIn(c.guid, OUT_OF_RANGE_COOLDOWN)
-        dprint(string.format("[inspect] DROP: %s L%d — %s (retry in %ds)",
-            tname, tlvl, info or "unknown", OUT_OF_RANGE_COOLDOWN))
-    end
-    if ClearInspectPlayer then ClearInspectPlayer() end
-    ClearCurrent()
+
+    -- Claude: snapshot the target identity before deferring, so we can
+    -- re-validate after the settle window even if 'current' changed
+    local snapUnit = c.unit
+    local snapGuid = c.guid
+
+    -- Claude: one-shot OnUpdate timer — fires after INSPECT_SETTLE_DELAY seconds,
+    -- then reads gear. 'current' stays set during the wait, which naturally
+    -- blocks TryInspect from starting a new inspect (it guards on 'if current then return end').
+    -- If CheckTimeout fires first (4s wall), it will ClearCurrent and our
+    -- re-validation below will safely discard the stale result.
+    local settleElapsed = 0
+    INSPECT_SETTLE_FRAME:SetScript("OnUpdate", function(self, elapsed) -- Claude: recycled module-level frame (no per-inspect leak)
+        settleElapsed = settleElapsed + elapsed
+        if settleElapsed < INSPECT_SETTLE_DELAY then return end
+        self:SetScript("OnUpdate", nil) -- Claude: cancel timer
+
+        -- Claude: re-validate — current may have been cleared by CheckTimeout
+        -- or replaced by a new inspect during the settle window
+        if not current or current.guid ~= snapGuid then
+            dprint(string.format("[inspect] settle: %s no longer current — dropping", snapGuid))
+            return
+        end
+        -- Claude: also guard unit-GUID match again after the settle window
+        if UnitGUID(snapUnit) ~= snapGuid then
+            dprint("[inspect] settle: GUID mismatch after settle — dropping")
+            ClearCurrent()
+            return
+        end
+
+        local tname = UnitName(snapUnit) or "?"
+        local tlvl = UnitLevel(snapUnit) or 0
+        local payload, info = BuildPayload(snapUnit, snapGuid) -- Claude: gear read after settle
+        if payload then
+            seen[snapGuid] = now()
+            MarkInspected(snapGuid, floor(time()))
+            dprint(string.format("[inspect] OK: %s L%d — %d slots equipped, payload %d bytes",
+                tname, tlvl, info, #payload))
+            EnqueueBroadcast(payload, tname)
+            -- direct-ingest our own scan so we save data even when no one
+            -- else is in our broadcast channels.
+            Ingest(payload, UnitName("player"))
+
+            -- Claude: vanity-flip verify pass. Snapshot the slot fingerprint we
+            -- just broadcast, then re-read at +1.5s. If transmog flipped any
+            -- slot in the meantime, broadcast the corrected payload.
+            local initialFP = InspectSlotFingerprint(snapUnit)
+            local verifyElapsed = 0
+            INSPECT_VERIFY_FRAME:SetScript("OnUpdate", function(self2, elapsed2) -- Claude: recycled module-level frame
+                verifyElapsed = verifyElapsed + elapsed2
+                if verifyElapsed < INSPECT_VERIFY_DELAY then return end
+                self2:SetScript("OnUpdate", nil)
+                -- Claude: target may have changed groups, gone out of range,
+                -- or been unspawned by now. UnitGUID guards all of that.
+                if UnitGUID(snapUnit) ~= snapGuid then return end
+                local verifyFP = InspectSlotFingerprint(snapUnit)
+                if verifyFP == initialFP then return end -- Claude: no flip detected
+                local payload2, info2 = BuildPayload(snapUnit, snapGuid)
+                if not payload2 then
+                    dprint(string.format("[inspect] verify: %s gear changed mid-pass but rebuild failed (%s) — keeping initial",
+                        tname, info2 or "unknown"))
+                    return
+                end
+                dprint(string.format("[inspect] verify: %s slot fingerprint changed — broadcasting corrected payload (%d slots, %d bytes)",
+                    tname, info2, #payload2))
+                EnqueueBroadcast(payload2, tname)
+                Ingest(payload2, UnitName("player"))
+            end)
+        else
+            -- incomplete inspect data (0-9 slots) is usually transient —
+            -- target moved out mid-response or server was slow. Short retry, not
+            -- the 15-min full cooldown which is reserved for successful scans.
+            markRetryIn(snapGuid, OUT_OF_RANGE_COOLDOWN)
+            dprint(string.format("[inspect] DROP: %s L%d — %s (retry in %ds)",
+                tname, tlvl, info or "unknown", OUT_OF_RANGE_COOLDOWN))
+        end
+        if ClearInspectPlayer then ClearInspectPlayer() end
+        ClearCurrent()
+    end)
 end
 
 -- ---------------- Self-scan ----------------
@@ -2572,6 +2734,29 @@ f:SetScript("OnEvent", function(self, event, ...)
         -- false-positive hints, no queue drain — until auras restore.
         auraSettleUntil = now() + AURA_SETTLE_WINDOW
         ScanRoster()
+        -- Claude: on instance entry, clear the 15-min in-memory cooldown for
+        -- all current group members so they get fresh inspects this run.
+        -- The 24-hour DB gate (EpogArmoryDB.lastScanned) is preserved so
+        -- mesh-wide dedup still works — this only refreshes our own client.
+        local inInst = IsInInstance()
+        if inInst then
+            local numRaid = GetNumRaidMembers()
+            local numParty = GetNumPartyMembers()
+            if numRaid > 0 then
+                for i = 1, numRaid do -- Claude: clear seen[] for each raid member
+                    local rUnit = "raid" .. i
+                    local rGuid = UnitGUID(rUnit)
+                    if rGuid then seen[rGuid] = nil end
+                end
+            elseif numParty > 0 then
+                for i = 1, numParty do -- Claude: clear seen[] for each party member
+                    local pUnit = "party" .. i
+                    local pGuid = UnitGUID(pUnit)
+                    if pGuid then seen[pGuid] = nil end
+                end
+            end
+            dprint("[world] instance entry — cleared seen[] for group, fresh inspects queued")
+        end
     else
         ScanRoster()
     end

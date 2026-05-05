@@ -594,10 +594,10 @@ end
 --   - Blizzard-style rank overlay (small diamond texture)
 local talentFrame
 local function BuildTalentFrame()
-    local TIERS = 7
+    local TIERS = 9    -- Claude: Ascension has TBC trees with up to 9 tiers
     local COLS  = 4
-    local CELL  = 40    -- bumped from 36 — better visual presence
-    local GAP   = 8
+    local CELL  = 36   -- Claude: slightly smaller to keep 9-row frame on screen
+    local GAP   = 6
     local TIER_LABEL_W = 20  -- column on left for tier numbers
     local GRID_LEFT = 14 + TIER_LABEL_W
     local GRID_TOP  = -86
@@ -644,24 +644,20 @@ local function BuildTalentFrame()
         t.tabBtns[tabIdx] = tb
     end
 
-    -- v1.3+: class-themed background. Blizzard's PlayerTalentFrame uses
-    -- 4 quadrant tiles named "<base>-TopLeft", "-TopRight", "-BotLeft",
-    -- "-BotRight" under Interface\TalentFrame\, where <base> comes from
-    -- GetTalentTabInfo's background field. We mirror that. If the file
-    -- doesn't exist, the texture renders blank (no harm done).
-    local BG_INSET = 2 -- inset the background slightly inside the grid area
-    local function makeBgQuad(point, x, y)
-        local tex = t:CreateTexture(nil, "BACKGROUND")
-        tex:SetWidth(GRID_W / 2)
-        tex:SetHeight(GRID_H / 2)
-        tex:SetPoint(point, t, "TOPLEFT", GRID_LEFT + x, GRID_TOP - y)
-        tex:SetVertexColor(0.55, 0.55, 0.55, 0.85) -- dim a bit so icons pop
-        return tex
-    end
-    t.bgTL = makeBgQuad("TOPLEFT",  BG_INSET,                BG_INSET)
-    t.bgTR = makeBgQuad("TOPLEFT",  BG_INSET + GRID_W / 2,   BG_INSET)
-    t.bgBL = makeBgQuad("TOPLEFT",  BG_INSET,                BG_INSET + GRID_H / 2)
-    t.bgBR = makeBgQuad("TOPLEFT",  BG_INSET + GRID_W / 2,   BG_INSET + GRID_H / 2)
+    -- v1.3+: class-themed background. Two halves cover the grid area.
+    -- OVERLAY layer: above the dialog backdrop tile (BACKGROUND/BORDER),
+    -- still below child frame buttons (child frames always win over parent).
+    -- No subLevel arg — not supported in 3.3.5, silently dropped.
+    -- Claude: OVERLAY, no subLevel — deterministic ordering in 3.3.5
+    t.bgLeft = t:CreateTexture(nil, "OVERLAY")
+    t.bgLeft:SetWidth(GRID_W / 2)
+    t.bgLeft:SetHeight(GRID_H)
+    t.bgLeft:SetPoint("TOPLEFT", t, "TOPLEFT", GRID_LEFT, GRID_TOP)
+
+    t.bgRight = t:CreateTexture(nil, "OVERLAY")
+    t.bgRight:SetWidth(GRID_W / 2)
+    t.bgRight:SetHeight(GRID_H)
+    t.bgRight:SetPoint("TOPLEFT", t, "TOPLEFT", GRID_LEFT + GRID_W / 2, GRID_TOP)
 
     -- Tier labels down the left side. 7 rows of "1" through "7" so the
     -- viewer immediately recognizes the talent-tree row structure.
@@ -686,7 +682,7 @@ local function BuildTalentFrame()
         for _, a in ipairs(t.arrowPool) do
             if not a:IsShown() then return a end
         end
-        local a = t:CreateTexture(nil, "ARTWORK", nil, 1)
+        local a = t:CreateTexture(nil, "ARTWORK") -- Claude: subLevel arg silently dropped on 3.3.5 — removed (audit v1.3.4)
         a:SetTexture("Interface\\Buttons\\WHITE8X8")
         a:SetVertexColor(1, 0.85, 0.3, 0.9)
         a:Hide()
@@ -697,43 +693,39 @@ local function BuildTalentFrame()
         for _, a in ipairs(t.arrowPool) do a:Hide() end
     end
 
-    -- Pre-create 4×7 grid of talent buttons. Hidden by default; populated
-    -- only when the active tab has a talent at that (tier, column).
+    -- Pre-create 4×9 grid of talent cells. Frame (not Button) — we only
+    -- need hover/tooltip, not click. Frame + EnableMouse is the reliable
+    -- pattern; Button internal hit-testing can eat OnEnter in 3.3.5.
+    -- Claude: Frame not Button — avoids Button hit-test eating OnEnter
     t.gridCells = {}
     for tier = 1, TIERS do
         for col = 1, COLS do
-            local b = CreateFrame("Button", nil, t)
+            local b = CreateFrame("Frame", nil, t)
+            b:EnableMouse(true)
             b:SetWidth(CELL); b:SetHeight(CELL)
             b:SetPoint("TOPLEFT", t, "TOPLEFT",
                 GRID_LEFT + (col - 1) * (CELL + GAP),
                 GRID_TOP - (tier - 1) * (CELL + GAP))
 
-            -- Inner icon (slightly inset for the border to show)
-            b.icon = b:CreateTexture(nil, "BORDER")
-            b.icon:SetPoint("TOPLEFT", 3, -3)
-            b.icon:SetPoint("BOTTOMRIGHT", -3, 3)
+            -- Background texture fills the full button. Doubles as the "border"
+            -- because the icon is inset 2px, leaving a 2px strip of bg color
+            -- visible around the edge. Colored in RenderTab via SetVertexColor.
+            -- Avoids SetBackdrop (can fail on Button frames in 3.3.5) entirely.
+            -- Claude: CreateTexture bg replaces SetBackdrop — tooltip-safe, always works
+            b.bg = b:CreateTexture(nil, "BACKGROUND")
+            b.bg:SetAllPoints(b)
+            b.bg:SetTexture("Interface\\Buttons\\WHITE8X8")
+            b.bg:SetVertexColor(0.12, 0.12, 0.12, 1)
+
+            -- Icon fills the interior (2px inset so bg strip shows as border)
+            b.icon = b:CreateTexture(nil, "ARTWORK")
+            b.icon:SetPoint("TOPLEFT", 2, -2)
+            b.icon:SetPoint("BOTTOMRIGHT", -2, 2)
             b.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 
-            -- Square slot border that fits a Blizzard talent button look.
-            -- UI-EmptySlot-Disabled is a clean square with metallic edge —
-            -- a closer match to the native talent UI than UI-Quickslot2.
-            b.border = b:CreateTexture(nil, "OVERLAY")
-            b.border:SetTexture("Interface\\Buttons\\UI-EmptySlot-Disabled")
-            b.border:SetPoint("TOPLEFT", -2, 2)
-            b.border:SetPoint("BOTTOMRIGHT", 2, -2)
-
-            -- Rank background — small diamond at the bottom-right, mimicking
-            -- Blizzard's PlayerTalentFrame talent-rank badge. Texture is the
-            -- standard talent rank border; if missing on this client we just
-            -- show the text alone (rankBG renders blank, no harm).
-            b.rankBG = b:CreateTexture(nil, "OVERLAY", nil, 1)
-            b.rankBG:SetTexture("Interface\\TalentFrame\\TalentFrame-RankBorder")
-            b.rankBG:SetWidth(CELL * 0.55)
-            b.rankBG:SetHeight(CELL * 0.55)
-            b.rankBG:SetPoint("BOTTOMRIGHT", 4, -4)
-
+            -- Rank text at bottom-right corner, drawn above icon
             b.rankText = b:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-            b.rankText:SetPoint("CENTER", b.rankBG, "CENTER", -1, 1)
+            b.rankText:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 2)
             b.rankText:SetShadowOffset(1, -1)
 
             b:SetScript("OnEnter", function(self)
@@ -787,21 +779,21 @@ local function BuildTalentFrame()
         local meta  = EpogTalentTreeDB and EpogTalentTreeDB[cls]
             and EpogTalentTreeDB[cls].tabs and EpogTalentTreeDB[cls].tabs[tabIdx]
 
-        -- v1.3+: load class-themed background. Blizzard texture path is
-        -- Interface\TalentFrame\<base>-TopLeft.blp etc., where <base>
-        -- comes from GetTalentTabInfo's `background` field. If the file
-        -- doesn't exist on this client (older Ascension build, etc.) the
-        -- texture renders transparent and only the dialog backdrop shows.
+        -- Claude: try class-specific L/R art; fall back to solid dark if missing/empty
         local bgBase = meta and meta.background
         if bgBase and bgBase ~= "" then
             local p = "Interface\\TalentFrame\\" .. bgBase
-            t.bgTL:SetTexture(p .. "-TopLeft")
-            t.bgTR:SetTexture(p .. "-TopRight")
-            t.bgBL:SetTexture(p .. "-BottomLeft")
-            t.bgBR:SetTexture(p .. "-BottomRight")
+            t.bgLeft:SetTexture(p .. "-L")
+            t.bgRight:SetTexture(p .. "-R")
+            t.bgLeft:SetVertexColor(1, 1, 1, 1)
+            t.bgRight:SetVertexColor(1, 1, 1, 1)
         else
-            t.bgTL:SetTexture(nil); t.bgTR:SetTexture(nil)
-            t.bgBL:SetTexture(nil); t.bgBR:SetTexture(nil)
+            -- No class art available — render a solid dark panel so the grid
+            -- area is visually distinct from the frame edge tile.
+            t.bgLeft:SetTexture("Interface\\Buttons\\WHITE8X8")
+            t.bgRight:SetTexture("Interface\\Buttons\\WHITE8X8")
+            t.bgLeft:SetVertexColor(0.06, 0.05, 0.04, 0.92)
+            t.bgRight:SetVertexColor(0.06, 0.05, 0.04, 0.92)
         end
 
         -- Subtitle: spec name + points spent
@@ -827,32 +819,36 @@ local function BuildTalentFrame()
                 local key = talent.tier .. "," .. talent.column
                 local cell = t.gridCells[key]
                 if cell then
+                    -- Set data fields FIRST — tooltip reads these on hover
+                    -- Claude: talentName assigned before any call that could error
+                    cell.talentName    = talent.name
+                    cell.talentRank    = ranks[i] or 0
+                    cell.talentMaxRank = talent.maxRank or 0
+
+                    local rank    = cell.talentRank
+                    local maxRank = cell.talentMaxRank
+
                     cell.icon:SetTexture(
                         (talent.icon and talent.icon ~= "") and talent.icon
                         or "Interface\\Icons\\INV_Misc_QuestionMark")
-                    local rank = ranks[i] or 0
-                    local maxRank = talent.maxRank or 0
+
+                    -- bg:SetVertexColor colors the 2px border strip around icon
                     if rank > 0 then
                         cell.icon:SetDesaturated(false)
                         if rank >= maxRank then
-                            -- Maxed — bright green like Blizzard's UI
+                            cell.bg:SetVertexColor(0.15, 0.55, 0.15, 1)  -- green
                             cell.rankText:SetTextColor(0.2, 1, 0.2)
-                            cell.rankText:SetText(tostring(rank))
                         else
-                            -- Partial — bright yellow
+                            cell.bg:SetVertexColor(0.5, 0.4, 0.05, 1)    -- amber
                             cell.rankText:SetTextColor(1, 0.95, 0.5)
-                            cell.rankText:SetText(tostring(rank))
                         end
-                        cell.border:SetVertexColor(1, 1, 1, 1)
+                        cell.rankText:SetText(tostring(rank))
                     else
                         cell.icon:SetDesaturated(true)
+                        cell.bg:SetVertexColor(0.12, 0.12, 0.12, 1)      -- dark gray
                         cell.rankText:SetTextColor(0.55, 0.55, 0.55)
                         cell.rankText:SetText("0")
-                        cell.border:SetVertexColor(0.5, 0.5, 0.5, 1)
                     end
-                    cell.talentName    = talent.name
-                    cell.talentRank    = rank
-                    cell.talentMaxRank = maxRank
                     cell:Show()
                 end
             end
@@ -981,6 +977,11 @@ local function BuildTalentFrame()
 end
 
 -- Public opener — called from the inspect frame's "Talents" button.
+-- Claude (audit fix v1.3.4): build once, reuse on subsequent opens.
+-- The previous destroy+rebuild pattern leaked a frame per open (WoW frames
+-- can never be GC'd) and grew UISpecialFrames unbounded (tinsert ran
+-- inside BuildTalentFrame). SetPlayer → RenderTab already clears prior
+-- spec state cleanly, so rebuilding the frame structure was unnecessary.
 function _G.EpogArmory_OpenTalentsFor(player, group)
     if not talentFrame then talentFrame = BuildTalentFrame() end
     talentFrame:ClearAllPoints()
