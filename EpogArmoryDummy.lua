@@ -37,9 +37,25 @@ local IDLE_STOP_THRESHOLD = 3
 -- "Heroic Training Dummy") with one rule.
 local DUMMY_NAME_PATTERN = "Training Dummy"
 
--- Marker: Fishing (user confirmed `/cast Fishing` in chat produces
--- SPELL_CAST_FAILED "Must have a Fishing Pole equipped" in the log).
--- Fails INSTANTLY — single log line, no SpellStopCasting timing required.
+-- Marker: Fishing primary, Basic Campfire fallback.
+--
+-- Primary: `/cast Fishing` produces SPELL_CAST_FAILED with reason
+-- "Must have a Fishing Pole equipped" — verified empirically. Fails
+-- INSTANTLY — single log line, no SpellStopCasting timing required.
+-- Universal: every character can attempt `/cast Fishing` (spell id 7620
+-- is hardcoded in the client, not gated by learning the profession).
+--
+-- Edge case: if the player has a Fishing Pole equipped, /cast Fishing
+-- SUCCEEDS instead of failing — producing SPELL_CAST_START not FAILED.
+-- That breaks our marker. Real-world likelihood is tiny (no DPS spec
+-- equips a pole), but the fallback covers it for players who also
+-- have Cooking learned: `/cast Basic Campfire` will fail with its own
+-- SPELL_CAST_FAILED ("You can't do that here" / "Try this outside")
+-- in a city near a dummy.
+--
+-- The macro chains both lines. Both /cast lines execute in sequence;
+-- whichever produces a SPELL_CAST_FAILED is accepted as the marker.
+-- The MARKER_SPELL_NAMES table is keyed by name for O(1) lookup in CLEU.
 --
 -- The marker fires via a SecureActionButtonTemplate that the user clicks.
 -- Addon-script CastSpellByName silently fails on Epoch (proven by the
@@ -49,10 +65,22 @@ local DUMMY_NAME_PATTERN = "Training Dummy"
 -- the call to a secure execution context. So the addon UI prompts the
 -- user to click a button at the end of the parse — that single click
 -- is the only manual step.
-local MARKER_SPELL_NAME         = "Fishing"
-local MARKER_MACROTEXT          = "/cast Fishing"
+local MARKER_SPELL_NAMES        = {
+    ["Fishing"]        = true,  -- Claude v1.7.1: primary marker, fails on no pole
+    ["Basic Campfire"] = true,  -- Claude v1.7.1: fallback for pole-equipped + Cooking-learned players
+}
+local MARKER_MACROTEXT          = "/cast Fishing\n/cast Basic Campfire"  -- Claude v1.7.1: chain both attempts; either FAILED line is a valid marker
 local MARKER_VERIFY_TIMEOUT     = 3.0  -- seconds to wait for CLEU after click
-local POST_COMBAT_HARD_TIMEOUT  = 120  -- max seconds in stopping state before giving up
+-- Claude v1.7.2: strict 10s validate window. Was POST_COMBAT_HARD_TIMEOUT=120
+-- which gave the user effectively unlimited time to click; in practice the
+-- 90s log file would close cleanly but the marker could land ~100s+ in
+-- (epoglogs report: marker at T+103s). The site now caps every parse at
+-- a canonical 90s for leaderboard fairness, so the addon's job is purely
+-- UX: make it OBVIOUS when the click window opens and closes.
+--
+-- Window matches LOG_DURATION_SEC - MARKER_TIME_SEC (90 - 80 = 10).
+-- Hard-fail at end of window with "LOG FAILED - click Reset to try again".
+local VALIDATE_WINDOW_SEC       = LOG_DURATION_SEC - MARKER_TIME_SEC
 
 -- Allowed aura sources: self + own pets/summons + vehicle.
 -- Class summons (Hunter pet, Warlock demon, Mage Water Elemental, Priest
@@ -100,7 +128,8 @@ local MAX_FIGHT_HISTORY = 50
 -- ============================================================================
 
 local frame              = nil          -- the UI frame, lazily built
-local state              = "idle"       -- "idle" | "armed" | "logging" | "stopping" | "stopped"
+local state              = "idle"       -- "idle" | "armed" | "logging" | "stopping" | "stopped" | "practice"
+local wasPractice        = false        -- v1.7.10: true when current "stopped" state came from practice (not a real log)
 local fightStartTime     = nil          -- GetTime() when combat started
 local validThroughout    = true         -- sticky false on any violation
 local invalidReasons     = {}           -- set of reason strings
@@ -113,6 +142,7 @@ local lastDummyHitTime   = 0            -- GetTime() of last player/pet damage o
 local stoppingStartTime  = nil          -- GetTime() when state entered "stopping" (for hard timeout)
 local fightTotalDamage   = 0            -- sum of damage from player+pet to dummy this fight
 local logFilename        = nil          -- expected combat-log filename, computed when LoggingCombat(true) fires
+local testMode           = false        -- Claude v1.7.1: /epogarmory testvalidate — short-circuit straight to "stopping" so user can click Validate without doing a full parse
 
 -- Live aura listings for the UI. Recomputed each tick.
 local currentPlayerAuras   = {}         -- list of { name, source, allowed }
@@ -409,6 +439,7 @@ local function DoStartLogging()
     lastDummyName     = UnitName("target")
     savedDummyGUID    = UnitGUID("target")
     lastDummyHitTime  = GetTime() -- count the start of combat as "just hit"
+    wasPractice       = false    -- v1.7.10: defensive — real log clears the practice flag
 
     -- Initial aura check (T+0). If we start with junk auras already on,
     -- validThroughout flips false immediately and the marker won't emit.
@@ -424,6 +455,43 @@ local function DoStartLogging()
     return true
 end
 
+-- v1.7.10: practice mode. When the user attacks a dummy without
+-- having opted into real logging (config.dummyAutoLog == false), we
+-- still want to show DPS + timer + auras as a free DPS meter. This
+-- function mirrors DoStartLogging's state setup but skips the actual
+-- LoggingCombat call — no file is written, no marker fires, no
+-- 1:30 limit is enforced.
+--
+-- State transitions:
+--   idle -(combat with dummy, auto-log OFF)-> practice
+--   practice -(combat ends OR Stop clicked)-> stopped (with wasPractice=true)
+--   stopped -(Reset)-> idle
+local function DoStartPractice()
+    if not IsDummyTargeted() then return false end
+    if not IsCity() then return false end
+
+    fightStartTime    = GetTime()
+    validThroughout   = true   -- not validated in practice; reset for consistency
+    invalidReasons    = {}
+    markerEmitted     = false
+    markerVerified    = false
+    pendingMarker     = false
+    stoppingStartTime = nil
+    fightTotalDamage  = 0
+    lastDummyName     = UnitName("target")
+    savedDummyGUID    = UnitGUID("target")
+    lastDummyHitTime  = GetTime()
+    logFilename       = nil    -- no file in practice mode
+    wasPractice       = false  -- gets flipped true when practice transitions to stopped
+
+    -- The key difference from DoStartLogging: NO LoggingCombat(true).
+    -- /combatlog stays in whatever state the user had it in (almost
+    -- always off, since practice is the no-log path).
+
+    SetState("practice")
+    return true
+end
+
 -- Stop the log and finalize the parse. Called from both the natural T+1:30
 -- timer expiry AND the idle-detection early-exit in the stopping window.
 -- 'reason' is added to invalidReasons (and flips validThroughout false)
@@ -436,6 +504,24 @@ local function FinishFight(reason)
         validThroughout = false
     end
     SetState("stopped")
+    -- Claude v1.7.1: testMode prints its own verdict (focused on whether
+    -- the marker round-trip worked, not the parse verdict) and does NOT
+    -- save to history. Clear the flag at the end so future real parses
+    -- run normally.
+    if testMode then
+        if markerVerified then
+            print("|cffffaa44EpogArmory|r [testvalidate]: |cff66ff66MARKER VERIFIED|r — the secure-button mechanism works on this client.")
+            if logFilename then
+                print("  |cffaaaaaa-|r marker line is in: |cffffd200" .. logFilename .. "|r")
+            end
+        else
+            print("|cffffaa44EpogArmory|r [testvalidate]: |cffff6666MARKER NOT VERIFIED|r — Validate was not clicked, or the cast produced no CLEU event.")
+            print("  |cffaaaaaa-|r if you didn't click Validate, run /epogarmory testvalidate again and click the green button before it times out.")
+            print("  |cffaaaaaa-|r if you DID click and still see this, the marker mechanism is broken on this client — report it.")
+        end
+        testMode = false
+        return
+    end
     PrintVerdict()
     SaveFightRecord()
 end
@@ -449,14 +535,20 @@ local function OnEnterCombat()
         DoStartLogging()
         return
     end
-    -- Auto-log path: user has the config option on, idle state, and
-    -- conditions match.
-    if state == "idle"
-       and EpogArmoryDB and EpogArmoryDB.config
-       and EpogArmoryDB.config.dummyAutoLog
-       and IsDummyTargeted() and IsCity()
-    then
-        DoStartLogging()
+    -- v1.7.10: from idle + dummy + city, branch on dummyAutoLog:
+    --   ON  → real /combatlog session (DoStartLogging)
+    --   OFF → practice mode (DPS meter without log file)
+    -- Practice fires by default if the user hasn't opted into logging,
+    -- so the addon doubles as a free DPS readout when they're just
+    -- training on a dummy.
+    if state == "idle" and IsDummyTargeted() and IsCity() then
+        local autoLog = EpogArmoryDB and EpogArmoryDB.config
+            and EpogArmoryDB.config.dummyAutoLog
+        if autoLog then
+            DoStartLogging()
+        else
+            DoStartPractice()
+        end
     end
 end
 
@@ -484,6 +576,14 @@ end)
 local function OnLeaveCombat()
     _DebugPrint(string.format("PLAYER_REGEN_ENABLED fired. state=%s, elapsed=%.1f",
         state, fightStartTime and (GetTime() - fightStartTime) or -1))
+    -- v1.7.10: practice mode terminates cleanly on combat end. No log
+    -- to stop, no verdict to compute — just freeze the final DPS and
+    -- transition to "stopped" so the user can see the result.
+    if state == "practice" then
+        wasPractice = true
+        SetState("stopped")
+        return
+    end
     if state ~= "logging" and state ~= "stopping" then return end
     local elapsed = GetTime() - (fightStartTime or GetTime())
 
@@ -500,8 +600,9 @@ local function OnLeaveCombat()
     -- combat-log entries on Epoch (protection model requires a hardware
     -- event). The user's click on the secure button is that event.
     --
-    -- If they don't click within POST_COMBAT_HARD_TIMEOUT seconds of
-    -- entering stopping, OnTick force-finishes with no marker (INVALID).
+    -- If they don't click within VALIDATE_WINDOW_SEC seconds of
+    -- entering stopping, OnTick force-finishes with no marker and
+    -- shows "LOG FAILED - click Reset to try again".
     if frame and frame:IsShown() then frame.UpdateUI() end
 end
 
@@ -513,9 +614,29 @@ local function OnTick()
         if frame and frame:IsShown() then frame.UpdateUI() end
         return
     end
+    -- v1.7.10: practice mode tick — refresh UI for live DPS/timer,
+    -- update aura listings, but DON'T enforce 1:30 or run the marker
+    -- flow. Practice runs as long as combat lasts.
+    if state == "practice" then
+        ValidateNow() -- updates currentPlayerAuras/currentTargetDebuffs for display
+        if frame and frame:IsShown() then frame.UpdateUI() end
+        return
+    end
     if state ~= "logging" and state ~= "stopping" then return end
 
     local elapsed = GetTime() - (fightStartTime or GetTime())
+
+    -- Claude v1.7.1: testMode short-circuits both aura validation and
+    -- the post-combat timeout. The test is purely about exercising
+    -- the marker round-trip (click -> /cast Fishing -> CLEU FAILED ->
+    -- markerVerified), not about validating a real parse. Skip the
+    -- normal tick logic entirely; the user clicks Validate at their
+    -- leisure and the existing PostClick + StartMarkerVerifyWait
+    -- handles the rest.
+    if testMode then
+        if frame and frame:IsShown() then frame.UpdateUI() end
+        return
+    end
 
     -- Belt-and-suspenders aura recheck. UNIT_AURA also drives validation,
     -- this is the redundant timer-based check.
@@ -534,19 +655,18 @@ local function OnTick()
         SetState("stopping")
     end
 
-    -- Stopping window: wait for combat to actually end so we can emit
-    -- the marker out of lockdown. The user disengages naturally after
-    -- they're done with the parse; PLAYER_REGEN_ENABLED triggers the
-    -- marker emission + log stop.
-    if state == "stopping" then
-        -- Hard timeout: if the user keeps fighting forever, eventually
-        -- force-stop the log without a marker. Counted from when
-        -- "stopping" began, not from combat start, so it always
-        -- gives the user POST_COMBAT_HARD_TIMEOUT extra seconds to
-        -- disengage after T+1:20.
+    -- Stopping window: T+1:20 -> T+1:30. The user has VALIDATE_WINDOW_SEC
+    -- (10s) to click the Validate button. If they click, PostClick fires
+    -- the marker and StartMarkerVerifyWait calls FinishFight. If they
+    -- don't click, we hard-fail here at the end of the window — log stops,
+    -- no marker, "LOG FAILED" verdict shown so the user knows to Reset.
+    --
+    -- Claude v1.7.2: tightened from 120s open window to 10s strict.
+    -- See VALIDATE_WINDOW_SEC comment above.
+    if state == "stopping" and not markerEmitted then
         local stoppingFor = GetTime() - (stoppingStartTime or GetTime())
-        if stoppingFor >= POST_COMBAT_HARD_TIMEOUT then
-            FinishFight("user did not disengage from dummy in time (marker not emitted)")
+        if stoppingFor >= VALIDATE_WINDOW_SEC then
+            FinishFight("validate window expired (10s)")
             return
         end
     end
@@ -757,7 +877,14 @@ local function BuildFrame()
             -- print — the user knows they cancelled intentionally.
             if LoggingCombat then LoggingCombat(false) end
             SetState("idle")
+        elseif state == "practice" then
+            -- v1.7.10: stop practice early. No log to close, just freeze
+            -- the DPS readout by transitioning to stopped with the
+            -- wasPractice flag.
+            wasPractice = true
+            SetState("stopped")
         elseif state == "stopped" then
+            wasPractice = false
             SetState("idle")
         end
     end)
@@ -793,6 +920,13 @@ local function BuildFrame()
             f.stateBadge:SetText("LOGGING")
             f.stateBadge:SetTextColor(0.2, 0.9, 0.2)
             f.actionBtn:SetText("Stop")
+        elseif state == "practice" then
+            -- v1.7.10: practice mode — DPS meter without /combatlog file.
+            -- Shown in cyan to clearly differentiate from the green
+            -- "LOGGING" state that produces a real log for upload.
+            f.stateBadge:SetText("PRACTICE")
+            f.stateBadge:SetTextColor(0.3, 0.85, 1)
+            f.actionBtn:SetText("Stop")
         elseif state == "stopping" then
             -- Past T+1:20 — user clicks VALIDATE to stamp the log AND
             -- force-stop logging.
@@ -816,6 +950,16 @@ local function BuildFrame()
             else
                 subState = "show-button"
                 f.validateContainer:SetAlpha(1) -- visible
+                -- Claude v1.7.2: live countdown on the button label so the
+                -- user can see exactly how much time they have to click.
+                -- ceil() so "1" still shows during the final ~1s before
+                -- FinishFight fires at the window boundary. math.max(1, ...)
+                -- so it never reads "0" or negative — at the moment the
+                -- window expires, OnTick triggers FinishFight in the same
+                -- frame and the button disappears.
+                local stoppingFor = GetTime() - (stoppingStartTime or GetTime())
+                local remaining = math.max(1, math.ceil(VALIDATE_WINDOW_SEC - stoppingFor))
+                f.validateBtn:SetText(string.format("VALIDATE (%d)", remaining))
                 f.validateHint:SetText("|cff888888click to stamp the log and stop logging|r")
                 f.validateHint:Show()
             end
@@ -835,8 +979,19 @@ local function BuildFrame()
             -- IsCleanVerdict above. Reset SetTextColor to white so the
             -- inline color codes show through cleanly.
             f.verdictLabel:SetTextColor(1, 1, 1)
-            if IsCleanVerdict() then
+            if wasPractice then
+                -- v1.7.10: practice ended (combat ended or user clicked
+                -- Stop). No upload-related verdict — just acknowledge
+                -- the run. Final DPS is still shown by the dpsLabel
+                -- below.
+                f.verdictLabel:SetText("|cff66ccffPractice complete|r - no log file written")
+            elseif IsCleanVerdict() then
                 f.verdictLabel:SetText("Log: |cff66ff66CLEAN|r - valid for upload")
+            elseif invalidReasons["validate window expired (10s)"] then
+                -- Claude v1.7.2: explicit failure mode for the strict
+                -- 10s validate window. User missed the click; prompt
+                -- them clearly to Reset and try again.
+                f.verdictLabel:SetText("|cffff6666LOG FAILED|r - click Reset to try again")
             else
                 f.verdictLabel:SetText("Log: |cffff6666INVALID|r - rejected on upload")
             end
@@ -861,19 +1016,49 @@ local function BuildFrame()
             local dps = fightTotalDamage / secs
             f.dpsLabel:SetText(string.format("|cffaaccff%s|r |cffffffffDPS|r", FmtNum(dps)))
             f.totalLabel:SetText(string.format("|cff888888%s damage|r", FmtNum(fightTotalDamage)))
+        elseif state == "practice" and fightStartTime then
+            -- v1.7.10: practice mode timer counts up without a target.
+            -- Format "M:SS" rather than "M:SS / 1:30" since no fixed
+            -- limit applies. Progress bar shown in cyan to differentiate
+            -- from the green/yellow logging/stopping shades.
+            local elapsed = GetTime() - fightStartTime
+            f.timerLabel:SetText(string.format("%d:%02d",
+                floor(elapsed / 60), floor(elapsed % 60)))
+            -- Bar grows over the 1:30 reference window then caps. Even in
+            -- practice this is a useful visual of "how long have I been
+            -- swinging" without us needing extra UI.
+            progressFraction = math.min(elapsed / LOG_DURATION_SEC, 1)
+            f.progressFg:SetVertexColor(0.3, 0.7, 1, 1) -- cyan
+            local secs = math.max(elapsed, 1)
+            local dps = fightTotalDamage / secs
+            f.dpsLabel:SetText(string.format("|cffaaccff%s|r |cffffffffDPS|r", FmtNum(dps)))
+            f.totalLabel:SetText(string.format("|cff888888%s damage (practice)|r", FmtNum(fightTotalDamage)))
         elseif state == "stopped" then
-            progressFraction = 1
-            f.timerLabel:SetText("1:30 / 1:30")
-            if IsCleanVerdict() then
-                f.progressFg:SetVertexColor(0.4, 1, 0.4, 1) -- green for clean
+            local elapsed = fightStartTime and (GetTime() - fightStartTime) or 0
+            if wasPractice then
+                -- v1.7.10: practice run ended. Show actual elapsed (not
+                -- capped to 1:30) and a cyan bar so the final state is
+                -- clearly distinct from a real log's CLEAN/INVALID.
+                progressFraction = math.min(elapsed / LOG_DURATION_SEC, 1)
+                f.timerLabel:SetText(string.format("%d:%02d",
+                    floor(elapsed / 60), floor(elapsed % 60)))
+                f.progressFg:SetVertexColor(0.3, 0.7, 1, 1) -- cyan
             else
-                f.progressFg:SetVertexColor(1, 0.4, 0.4, 1) -- red for invalid
+                progressFraction = 1
+                f.timerLabel:SetText("1:30 / 1:30")
+                if IsCleanVerdict() then
+                    f.progressFg:SetVertexColor(0.4, 1, 0.4, 1) -- green for clean
+                else
+                    f.progressFg:SetVertexColor(1, 0.4, 0.4, 1) -- red for invalid
+                end
             end
-            local secs = math.min(fightStartTime and (GetTime() - fightStartTime) or LOG_DURATION_SEC,
-                LOG_DURATION_SEC)
+            local secs = wasPractice
+                and math.max(elapsed, 1)
+                or math.min(elapsed > 0 and elapsed or LOG_DURATION_SEC, LOG_DURATION_SEC)
             local dps = secs > 0 and (fightTotalDamage / secs) or 0
             f.dpsLabel:SetText(string.format("|cffaaccff%s|r |cffffffffDPS|r", FmtNum(dps)))
-            f.totalLabel:SetText(string.format("|cff888888%s damage|r", FmtNum(fightTotalDamage)))
+            f.totalLabel:SetText(string.format("|cff888888%s damage%s|r",
+                FmtNum(fightTotalDamage), wasPractice and " (practice)" or ""))
         else
             f.timerLabel:SetText("0:00 / 1:30")
             f.progressFg:SetVertexColor(0.4, 0.4, 0.4, 1)
@@ -1060,6 +1245,55 @@ _G.EpogArmoryDummy_Toggle = function()
     end
 end
 
+-- Claude v1.7.1: /epogarmory testvalidate — exercise the marker click
+-- round-trip without doing a full 1:30 dummy parse. Sets state to
+-- "stopping" with the validate button visible immediately. User clicks
+-- it; CLEU listens for SPELL_CAST_FAILED on Fishing/Basic Campfire; the
+-- existing PostClick + StartMarkerVerifyWait + FinishFight handles the
+-- rest. Skips aura validation and the post-combat hard timeout via the
+-- testMode flag in OnTick. Combat log IS started so the user can also
+-- verify by hand that the marker line lands in the .txt file.
+_G.EpogArmoryDummy_TestValidate = function()
+    if state == "logging" or state == "stopping" then
+        print("|cffffaa44EpogArmory|r [testvalidate]: a real parse is in progress — refusing to start test mode. Click Reset/Stop first.")
+        return
+    end
+    if not frame then frame = BuildFrame() end
+
+    -- Set up the same module state DoStartLogging would, minus the
+    -- city/dummy gates and minus capturing a real dummy GUID.
+    testMode          = true
+    validThroughout   = true
+    invalidReasons    = {}
+    markerEmitted     = false
+    markerVerified    = false
+    pendingMarker     = false
+    fightTotalDamage  = 0
+    lastDummyName     = "(test mode)"
+    savedDummyGUID    = nil
+    fightStartTime    = GetTime() - MARKER_TIME_SEC  -- pretend it's already past 1:20
+    stoppingStartTime = GetTime()
+    lastDummyHitTime  = GetTime()
+
+    -- Start /combatlog so the marker line actually lands in a file
+    -- the user can inspect. Capture the filename the same way
+    -- DoStartLogging does.
+    if LoggingCombat then LoggingCombat(true) end
+    logFilename = date("Logs/%Y-%m-%d-%H.%M.%S WoWCombatLog.txt")
+
+    -- Open the frame and jump straight to "stopping" — that's the
+    -- only state where the validate button is shown at alpha 1.
+    AnchorTopLeft(frame)
+    frame:Show()
+    SetState("stopping")
+    frame.UpdateUI()
+
+    print("|cffffaa44EpogArmory|r [testvalidate]: |cffffd200test mode active.|r")
+    print("  |cffaaaaaa-|r combat log started: |cffffd200" .. logFilename .. "|r")
+    print("  |cffaaaaaa-|r click the green |cff66ff66Validate|r button in the dummy frame to fire the marker.")
+    print("  |cffaaaaaa-|r a CLEAN result means the secure-button + /cast Fishing mechanism produced a SPELL_CAST_FAILED CLEU line.")
+end
+
 -- ============================================================================
 -- Init + event wiring
 -- ============================================================================
@@ -1145,9 +1379,16 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         -- arrive late, after we've already transitioned to "stopped".
         -- We still want to confirm it landed in the log file. State
         -- gate removed for this check.
-        if spellName == MARKER_SPELL_NAME
-           and (subevent == "SPELL_CAST_START" or subevent == "SPELL_CAST_FAILED")
-        then
+        --
+        -- Claude v1.7.1: FAILED-only (was START-or-FAILED). The site
+        -- contract only accepts SPELL_CAST_FAILED, so the addon's
+        -- in-game verdict needs to match — a SPELL_CAST_START from a
+        -- pole-equipped Fishing channel is NOT a valid marker even
+        -- though the log line exists, because the site won't accept it.
+        --
+        -- Claude v1.7.1: also accept any spell name in MARKER_SPELL_NAMES
+        -- to cover the Basic Campfire fallback for pole-equipped players.
+        if subevent == "SPELL_CAST_FAILED" and MARKER_SPELL_NAMES[spellName] then
             if not markerVerified then
                 _DebugPrint(string.format("marker observed in CLEU: %s '%s' (state=%s)",
                     subevent, spellName, state))
@@ -1156,8 +1397,9 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             return
         end
 
-        -- Hit + damage tracking only matters during logging/stopping.
-        if state ~= "logging" and state ~= "stopping" then return end
+        -- Hit + damage tracking matters during logging/stopping (real
+        -- parse) AND during practice mode (DPS meter without log).
+        if state ~= "logging" and state ~= "stopping" and state ~= "practice" then return end
 
         -- Hit + damage tracking on the dummy.
         if not savedDummyGUID or destGUID ~= savedDummyGUID then return end
