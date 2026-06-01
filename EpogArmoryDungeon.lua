@@ -691,6 +691,47 @@ BuildFrame = function()
     local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     close:SetPoint("TOPRIGHT", -2, -2)
 
+    -- v1.11.2: minimize/restore button. Text-based "−" / "+" label
+    -- (was a texture-based button in v1.11.1, but the texture path
+    -- rendered as a bevel without the icon on the user's client —
+    -- looked like a second X next to the close button). Text is
+    -- reliable across UI themes. Positioned to visually align with
+    -- the close button's X glyph.
+    f.minimizeBtn = CreateFrame("Button", nil, f)
+    f.minimizeBtn:SetSize(20, 20)
+    -- Anchor to the frame directly (not to `close`) so positioning is
+    -- predictable regardless of UIPanelCloseButton's internal padding.
+    -- -28 puts us just left of the close X; -8 matches its visible y.
+    f.minimizeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -28, -8)
+    f.minimizeBtn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+    f.minimizeBtn.label = f.minimizeBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    f.minimizeBtn.label:SetPoint("CENTER", 0, 1) -- +1y to optically center the dash glyph
+    f.minimizeBtn.label:SetText("−") -- U+2212 (minus sign) — visually heavier than ASCII '-'
+    f.minimizeBtn.label:SetTextColor(1, 0.82, 0) -- gold, matches close button
+    f.minimizeBtn:SetScript("OnClick", function(self)
+        f.minimized = not f.minimized
+        EpogArmoryDB = EpogArmoryDB or {}
+        EpogArmoryDB.config = EpogArmoryDB.config or {}
+        EpogArmoryDB.config.dungeonMinimized = f.minimized
+        self.label:SetText(f.minimized and "+" or "−")
+        if f.UpdateUI then f.UpdateUI() end
+    end)
+    f.minimizeBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+        GameTooltip:SetText(f.minimized and "Restore" or "Minimize")
+        GameTooltip:Show()
+    end)
+    f.minimizeBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    -- Compact status line — shown only when minimized. Single line
+    -- of text replacing the entire body of the frame. Format:
+    --   <DungeonShortName> · <Timer> · <N/M bosses> · <LOG/OFF>
+    f.compactStatus = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    f.compactStatus:SetPoint("TOP", 0, -32)
+    f.compactStatus:SetWidth(252)
+    f.compactStatus:SetJustifyH("CENTER")
+    f.compactStatus:Hide()
+
     -- Dungeon name (resolved + variant)
     f.dungeonLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
     f.dungeonLabel:SetPoint("TOP", 0, -30)
@@ -815,25 +856,107 @@ BuildFrame = function()
     -- ----------------------------------------------------------------
     -- UpdateUI — full redraw, called from event handlers + tick.
     -- ----------------------------------------------------------------
+    -- v1.11.1: helper used by both the minimized and full UI branches
+    -- to compute the same timer text. Returns (text, r, g, b) so the
+    -- caller can apply color in either GameFontHighlightSmall (compact)
+    -- or GameFontNormalLarge (full) without duplicating the logic.
+    local function ComputeTimerDisplay()
+        if logStartTime and loggingActive then
+            return FormatElapsed(GetTime() - logStartTime), 1, 1, 1
+        elseif logStartTime and logEndTime then
+            return FormatElapsed(logEndTime - logStartTime), 0.8, 0.8, 0.4
+        else
+            return "--:--", 0.5, 0.5, 0.5
+        end
+    end
+
+    -- v1.11.1: render path for the minimized state. One compact line:
+    --   <ShortName> · <Timer> · <N/M bosses> · <LOG/OFF>
+    -- All the bulky elements (boss/trash lists, prompts, action button,
+    -- variant container) stay hidden. Frame height fixed to ~52px.
+    local function RenderCompact()
+        -- Hide everything bulky
+        f.dungeonLabel:Hide()
+        f.variantContainer:Hide()
+        f.timerLabel:Hide()
+        f.statusBadge:Hide()
+        f.logStatusLabel:Hide()
+        f.prompt:Hide()
+        f.bossesLabel:Hide()
+        for _, row in ipairs(f.bossTexts) do row:Hide() end
+        f.trashLabel:Hide()
+        for _, row in ipairs(f.trashTexts) do row:Hide() end
+        f.logToggleBtn:Hide()
+
+        -- Build the compact line
+        local def = currentDungeon and DUNGEONS[currentDungeon] or nil
+        local shortName
+        if def then
+            if def.variants and currentVariant then
+                shortName = def.variants[currentVariant].shortName or currentVariant
+            elseif def.variants then
+                shortName = "?"  -- variant unresolved
+            else
+                -- Use first word of displayName as a "short name" heuristic
+                -- (Blackrock Depths -> Blackrock, Scholomance -> Scholomance,
+                --  Onyxia's Lair -> Onyxia's, Baradin Hold -> Baradin).
+                shortName = def.displayName:match("^(%S+)") or def.displayName
+            end
+        else
+            shortName = "(no dungeon)"
+        end
+
+        local timerText, tr, tg, tb = ComputeTimerDisplay()
+
+        local bossCount, total = 0, 0
+        if currentDungeon then
+            local bs = GetCurrentBosses()
+            total = #bs
+            for _, b in ipairs(bs) do
+                if bossKillTimes[b] then bossCount = bossCount + 1 end
+            end
+        end
+
+        local logTag = loggingActive and "|cff66ff66LOG|r" or "|cffff6666OFF|r"
+        local timerColor = string.format("|cff%02x%02x%02x", tr * 255, tg * 255, tb * 255)
+        f.compactStatus:SetText(string.format(
+            "|cffffd200%s|r  %s%s|r  |cffcccccc%d/%d|r  %s",
+            shortName, timerColor, timerText, bossCount, total, logTag))
+        f.compactStatus:Show()
+
+        -- Compact frame height: title (24) + status line (16) + padding
+        local compactHeight = 52
+        if math.abs(compactHeight - f:GetHeight()) > 1 then
+            f:SetHeight(compactHeight)
+        end
+    end
+
     function f.UpdateUI()
+        -- v1.11.1: branch on minimized state. The minimized path
+        -- short-circuits all the section rendering.
+        if f.minimized then
+            RenderCompact()
+            return
+        end
+
+        -- Restored state: ensure compactStatus is hidden, the full
+        -- elements get re-shown by their normal logic below.
+        f.compactStatus:Hide()
+        f.dungeonLabel:Show()
+        f.timerLabel:Show()
+        f.statusBadge:Show()
+        f.logStatusLabel:Show()
+        f.bossesLabel:Show()
+        f.trashLabel:Show()
+        f.logToggleBtn:Show()
+
         f.dungeonLabel:SetText(GetCurrentDisplayName())
 
-        -- v1.7.5: timer is now driven by log start/end, not dungeon entry.
-        --   logStartTime set + loggingActive: live count from start
-        --   logStartTime set + !loggingActive: frozen at (logEndTime - logStartTime)
-        --   logStartTime nil: show "--:--" (no log session this run)
-        local timerText
-        if logStartTime and loggingActive then
-            timerText = FormatElapsed(GetTime() - logStartTime)
-            f.timerLabel:SetTextColor(1, 1, 1)
-        elseif logStartTime and logEndTime then
-            timerText = FormatElapsed(logEndTime - logStartTime)
-            f.timerLabel:SetTextColor(0.8, 0.8, 0.4) -- yellowish: frozen
-        else
-            timerText = "--:--"
-            f.timerLabel:SetTextColor(0.5, 0.5, 0.5)
-        end
+        -- v1.11.1: timer text + color computed via ComputeTimerDisplay
+        -- helper so the compact mode renders an identical timer.
+        local timerText, tr, tg, tb = ComputeTimerDisplay()
         f.timerLabel:SetText(timerText)
+        f.timerLabel:SetTextColor(tr, tg, tb)
 
         -- Status badge
         if currentDungeon then
@@ -1074,6 +1197,16 @@ BuildFrame = function()
         if currentDungeon then f.UpdateUI() end
     end)
 
+    -- v1.11.1: apply persisted minimized state. Done here (not just at
+    -- PLAYER_LOGIN) because the frame is lazily built on first dungeon
+    -- entry, which can happen after PLAYER_LOGIN has already fired.
+    if EpogArmoryDB and EpogArmoryDB.config
+       and EpogArmoryDB.config.dungeonMinimized
+    then
+        f.minimized = true
+        f.minimizeBtn.label:SetText("+")
+    end
+
     return f
 end
 
@@ -1157,6 +1290,16 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         EpogArmoryDB.config = EpogArmoryDB.config or {}
         if EpogArmoryDB.config.raidAutoLog == nil then
             EpogArmoryDB.config.raidAutoLog = true
+        end
+        -- v1.11.1: restore minimized state if the frame already exists.
+        -- If not yet built (lazy), BuildFrame reads the same SV on
+        -- creation, so either path applies the persisted state.
+        if frame and EpogArmoryDB.config.dungeonMinimized ~= nil then
+            frame.minimized = EpogArmoryDB.config.dungeonMinimized
+            -- v1.11.2: sync the button label to match restored state
+            if frame.minimizeBtn and frame.minimizeBtn.label then
+                frame.minimizeBtn.label:SetText(frame.minimized and "+" or "−")
+            end
         end
         -- v1.7.11: restore the addonStartedLog claim across /reload via
         -- SavedVariables. Sanity-check against the actual API state:
