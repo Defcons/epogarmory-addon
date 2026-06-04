@@ -1,4 +1,16 @@
-# EpogArmory
+# EpogArmory → now **ConLogs-Epoch**
+
+> ## ⚠️ This addon has moved and been renamed.
+> **EpogArmory is now [ConLogs-Epoch](https://github.com/Defcons/ConLogsApp/releases/latest).**
+> It does everything EpogArmory did — same mesh, same gear inspector — plus it now embeds
+> your gear/talents straight into the combat log so a single uploaded log carries everything.
+>
+> **➡️ Download the latest ConLogs-Epoch:** https://github.com/Defcons/ConLogsApp/releases/latest
+>
+> Delete the old `EpogArmory` folder from your `Interface/AddOns/` and drop in `ConLogs-Epoch`.
+> Your saved data carries over automatically on first launch. This repo is no longer updated.
+
+---
 
 > **Inspect anyone on the server — no matter where they are.**
 
